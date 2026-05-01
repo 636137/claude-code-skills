@@ -22,7 +22,7 @@ def _all(root: Path, suffix: str) -> list[Path]:
     return sorted(root.rglob(f"*{suffix}"))
 
 
-@pytest.mark.parametrize("tree_fixture", ["snap_tree", "va_tree"])
+@pytest.mark.parametrize("tree_fixture", ["snap_tree", "va_tree", "telco_tree", "cpg_tree", "retail_tree"])
 def test_json_parses(tree_fixture, request):
     tree = request.getfixturevalue(tree_fixture)
     for p in _all(tree, ".json"):
@@ -30,7 +30,7 @@ def test_json_parses(tree_fixture, request):
             json.load(f)
 
 
-@pytest.mark.parametrize("tree_fixture", ["snap_tree", "va_tree"])
+@pytest.mark.parametrize("tree_fixture", ["snap_tree", "va_tree", "telco_tree", "cpg_tree", "retail_tree"])
 def test_bash_syntax(tree_fixture, request):
     tree = request.getfixturevalue(tree_fixture)
     for p in _all(tree, ".sh"):
@@ -38,7 +38,7 @@ def test_bash_syntax(tree_fixture, request):
         assert result.returncode == 0, f"{p} bash -n failed: {result.stderr}"
 
 
-@pytest.mark.parametrize("tree_fixture", ["snap_tree", "va_tree"])
+@pytest.mark.parametrize("tree_fixture", ["snap_tree", "va_tree", "telco_tree", "cpg_tree", "retail_tree"])
 def test_python_compiles(tree_fixture, request):
     tree = request.getfixturevalue(tree_fixture)
     for p in _all(tree, ".py"):
@@ -50,7 +50,7 @@ def test_python_compiles(tree_fixture, request):
 JINJA_BLOCK = re.compile(r"\{%")
 
 
-@pytest.mark.parametrize("tree_fixture", ["snap_tree", "va_tree"])
+@pytest.mark.parametrize("tree_fixture", ["snap_tree", "va_tree", "telco_tree", "cpg_tree", "retail_tree"])
 def test_no_unrendered_jinja_blocks(tree_fixture, request):
     tree = request.getfixturevalue(tree_fixture)
     for p in tree.rglob("*"):
@@ -60,7 +60,7 @@ def test_no_unrendered_jinja_blocks(tree_fixture, request):
         assert not JINJA_BLOCK.search(text), f"unrendered Jinja block in {p}"
 
 
-@pytest.mark.parametrize("tree_fixture", ["snap_tree", "va_tree"])
+@pytest.mark.parametrize("tree_fixture", ["snap_tree", "va_tree", "telco_tree", "cpg_tree", "retail_tree"])
 def test_no_unresolved_curly_outside_flow_json(tree_fixture, request):
     tree = request.getfixturevalue(tree_fixture)
     # These templates contain legitimate shell ${var} and Bedrock-flow {{var}} usage.
@@ -117,3 +117,18 @@ def test_snap_deploy_uses_inference_profile(snap_tree: Path):
     # Must not use the bare (non-profile) form anywhere standalone
     bare = re.findall(r'(?<!us\.)anthropic\.claude-haiku-4-5-20251001-v1:0', text)
     assert not bare, "deploy.sh uses bare model ID; on-demand throughput won't work"
+
+
+cfnlint = pytest.importorskip("cfnlint.api", reason="cfn-lint not installed")
+
+
+@pytest.mark.parametrize("tree_fixture", ["telco_tree", "cpg_tree", "retail_tree"])
+def test_cfn_stack_lints_clean(tree_fixture, request):
+    """Each emitted cfn/stack.yaml must pass cfn-lint with no errors (warnings OK)."""
+    tree = request.getfixturevalue(tree_fixture)
+    stack = tree / "cfn" / "stack.yaml"
+    assert stack.is_file()
+    from cfnlint import api
+    matches = api.lint(stack.read_text())
+    errors = [m for m in matches if str(m.rule.id).startswith("E")]
+    assert not errors, f"cfn-lint errors in {stack}: {errors}"

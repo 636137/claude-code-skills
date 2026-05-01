@@ -1,0 +1,140 @@
+# retail-store-ops — archetype rebuild of OneReach's US Retailer case study.
+# Source: https://onereach.ai/case-studies/us-retailer/
+#
+# OneReach consolidated per-store phone queues into a central AI-handled contact
+# center for a $10B U.S. retailer, with two-way SMS for appointment scheduling
+# and outbound marketing. This rebuild covers inbound voice + two-way SMS
+# appointment flow. Outbound marketing is explicitly out of scope (OneReach's
+# case page gives no segmentation/opt-in/cadence detail to replicate from).
+
+project_name: retail-store-ops
+region: us-east-1
+model_id: us.anthropic.claude-haiku-4-5-20251001-v1:0
+
+ingress:
+  type: lambda
+  lambda:
+    name: ingress
+    description: "Normalize inbound Connect voice or SMS payload into { channel, customer_id_or_phone, utterance }"
+
+channels: [connect, sms]
+emit_cfn: true
+
+specialists:
+  - name: store-locator
+    description: "Locates the nearest store and reports hours + capabilities."
+    instructions: |
+      You are a Store Locator specialist. Given a caller's ZIP or stated city,
+      return the three nearest stores with hours and capabilities.
+
+      Protocol:
+      1. Call find_nearest_stores with the zip.
+      2. Return STATUS=RESOLVED with up to 3 stores and a short summary.
+    tools:
+      - operation_id: find_nearest_stores
+        description: "Find the three nearest stores to a given ZIP code with current hours."
+        request:
+          type: object
+          required: [zip]
+          properties:
+            zip: { type: string }
+        response:
+          type: object
+          properties:
+            stores: { type: array, items: { type: object } }
+
+  - name: appointment-scheduler
+    description: "Books an in-store service appointment and sends an SMS confirmation."
+    instructions: |
+      You are an Appointment Scheduler specialist. You book in-store service
+      appointments (hardware pickup, service counter, in-store consult).
+
+      Protocol:
+      1. Call list_appointment_slots for the requested store and service type.
+      2. Ask caller to pick a slot; call book_appointment.
+      3. Return STATUS=SMS_CONFIRM (the router will trigger an SMS confirmation).
+    tools:
+      - operation_id: list_appointment_slots
+        description: "List the next 5 open appointment slots at a specific store for a service type."
+        request:
+          type: object
+          required: [store_id, service_type]
+          properties:
+            store_id: { type: string }
+            service_type: { type: string, enum: [CONSULT, HARDWARE_PICKUP, SERVICE_COUNTER] }
+        response:
+          type: object
+          properties:
+            slots: { type: array, items: { type: object } }
+      - operation_id: book_appointment
+        description: "Book an appointment slot for a customer and return a confirmation code."
+        request:
+          type: object
+          required: [store_id, slot_id, customer_phone]
+          properties:
+            store_id: { type: string }
+            slot_id: { type: string }
+            customer_phone: { type: string }
+            customer_name: { type: string }
+        response:
+          type: object
+          properties:
+            confirmation_code: { type: string }
+            slot_start: { type: string }
+            store_address: { type: string }
+
+  - name: order-status
+    description: "Looks up online-order status and delivery ETA."
+    instructions: |
+      You are an Order Status specialist. Given an order number, return the
+      current status (PLACED / PACKED / SHIPPED / DELIVERED), tracking URL, and ETA.
+
+      Protocol:
+      1. Call lookup_order.
+      2. Return STATUS=RESOLVED with a short natural-language summary.
+    tools:
+      - operation_id: lookup_order
+        description: "Look up an online order by its order number."
+        request:
+          type: object
+          required: [order_number]
+          properties:
+            order_number: { type: string }
+        response:
+          type: object
+          properties:
+            status: { type: string, enum: [PLACED, PACKED, SHIPPED, DELIVERED, CANCELLED] }
+            tracking_url: { type: string }
+            estimated_delivery_date: { type: string }
+
+supervisor:
+  temperature: 0.0
+  max_tokens: 40
+  fusion_rules: |
+    You are the Supervisor for a retail store-ops flow. Route to one of
+    RESOLVED, NEEDS_AGENT, or SMS_CONFIRM.
+
+    Rules (strict, top-to-bottom, first-match wins):
+    1. appointment-scheduler returned STATUS=SMS_CONFIRM -> SMS_CONFIRM (booked, SMS follow-up needed)
+    2. Any specialist returned STATUS=RESOLVED -> RESOLVED
+    3. Otherwise -> NEEDS_AGENT
+
+router:
+  branches: [RESOLVED, NEEDS_AGENT, SMS_CONFIRM]
+
+explainers:
+  RESOLVED:
+    instructions: |
+      You are writing a short voice or SMS reply to a retail customer whose
+      question was answered (store location + hours, order status, etc.). 2-3
+      sentences. If voice, read naturally with punctuation pacing. If SMS,
+      keep under 320 characters.
+  NEEDS_AGENT:
+    instructions: |
+      You are writing a handoff message explaining that we'll transfer the
+      caller to a live store associate. Keep it short (2 sentences) and warm.
+  SMS_CONFIRM:
+    instructions: |
+      You are writing an SMS confirmation for an in-store appointment just
+      booked. Include confirmation code, date/time, store address, and a
+      "reply C to cancel" opt-out hint. Keep under 320 characters total.

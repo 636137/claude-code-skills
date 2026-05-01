@@ -1,0 +1,308 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "{{ spec.project_name }} — Bedrock Prompt Flow stack (scaffolded). Parallel to scripts/deploy.sh; deploy one or the other, not both."
+
+Parameters:
+  CaseBucketName:
+    Type: String
+    Description: "S3 bucket for flow I/O staging. Must be globally unique. Suggested pattern: {{ spec.project_name }}-cases-<account>-<region>."
+  ModelId:
+    Type: String
+    Default: "{{ spec.model_id }}"
+    Description: "Bedrock inference-profile ID used by all Prompt/Agent nodes."
+{% if spec.knowledge_bases %}
+
+  OpenSearchCollectionArn:
+    Type: String
+    Description: "ARN of the pre-created OpenSearch Serverless collection for all KBs. See README — this stack does NOT create the collection."
+{% for kb in spec.knowledge_bases %}
+  {{ kb.pascal }}DataSourceBucketArn:
+    Type: String
+    Description: "ARN of the S3 bucket backing the {{ kb.name }} knowledge base."
+{% endfor %}
+{% endif %}
+
+Resources:
+
+  CaseBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref CaseBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+{% if spec.ingress.type == "lambda" %}
+  IngressLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "{{ spec.project_name }}-{{ spec.ingress.lambda_dir }}-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ingress-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:PutObject", "s3:ListBucket"]
+                Resource:
+                  - !GetAtt CaseBucket.Arn
+                  - !Sub "${CaseBucket.Arn}/*"
+
+  IngressLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "{{ spec.project_name }}-{{ spec.ingress.lambda_dir }}"
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt IngressLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          # Placeholder — replace with contents of lambda/{{ spec.ingress.lambda_dir }}/lambda_function.py
+          # at deploy time (e.g. via `aws lambda update-function-code`).
+          def lambda_handler(event, context):
+              return event
+{% endif %}
+
+{%- for s in spec.specialists %}
+
+  {{ s.pascal }}ActionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "{{ s.lambda_name }}-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  {{ s.pascal }}ActionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "{{ s.lambda_name }}"
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt {{ s.pascal }}ActionLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          # Placeholder — replace with contents of lambda/{{ s.snake }}_actions/lambda_function.py
+          # at deploy time.
+          def lambda_handler(event, context):
+              return event
+
+  {{ s.pascal }}LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref {{ s.pascal }}ActionLambda
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  {{ s.pascal }}AgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "BedrockAgentRole-{{ spec.project_name }}-{{ s.name }}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: bedrock.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: agent-perms
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${ModelId}"
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt {{ s.pascal }}ActionLambda.Arn
+
+  {{ s.pascal }}Agent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: "{{ s.agent_name }}"
+      AgentResourceRoleArn: !GetAtt {{ s.pascal }}AgentRole.Arn
+      FoundationModel: !Ref ModelId
+      Instruction: |
+        {{ s.instructions | replace('\n', '\n        ') }}
+      IdleSessionTTLInSeconds: 600
+      AutoPrepare: true
+{% if s.knowledge_bases %}
+      KnowledgeBases:
+{% for kb_ref in s.knowledge_bases %}
+        - KnowledgeBaseId: !GetAtt {{ kb_ref.replace('-', ' ').title().replace(' ', '') }}KnowledgeBase.KnowledgeBaseId
+          Description: "{{ kb_ref }} policy / FAQ knowledge base"
+{% endfor %}
+{% endif %}
+
+  {{ s.pascal }}AgentAlias:
+    Type: AWS::Bedrock::AgentAlias
+    Properties:
+      AgentId: !Ref {{ s.pascal }}Agent
+      AgentAliasName: live
+{%- endfor %}
+
+{% if spec.knowledge_bases %}
+
+  KBRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "{{ spec.project_name }}-kb-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: bedrock.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: kb-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+              - Effect: Allow
+                Action: aoss:APIAccessAll
+                Resource: !Ref OpenSearchCollectionArn
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:ListBucket"]
+                Resource: "*"
+{%- for kb in spec.knowledge_bases %}
+
+  {{ kb.pascal }}KnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: "{{ kb.kb_resource }}"
+      Description: "{{ kb.description }}"
+      RoleArn: !GetAtt KBRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/{{ kb.embedding_model_id }}"
+      StorageConfiguration:
+        Type: OPENSEARCH_SERVERLESS
+        OpensearchServerlessConfiguration:
+          CollectionArn: !Ref OpenSearchCollectionArn
+          VectorIndexName: "{{ kb.snake }}-index"
+          FieldMapping:
+            VectorField: bedrock-knowledge-base-default-vector
+            TextField: AMAZON_BEDROCK_TEXT_CHUNK
+            MetadataField: AMAZON_BEDROCK_METADATA
+
+  {{ kb.pascal }}DataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !Ref {{ kb.pascal }}KnowledgeBase
+      Name: "{{ kb.name }}-s3-source"
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !Ref {{ kb.pascal }}DataSourceBucketArn
+      VectorIngestionConfiguration:
+        ChunkingConfiguration:
+          ChunkingStrategy: {{ kb.chunking_strategy }}
+{% if kb.chunking_strategy == "FIXED_SIZE" %}
+          FixedSizeChunkingConfiguration:
+            MaxTokens: 512
+            OverlapPercentage: 20
+{% endif %}
+{%- endfor %}
+{% endif %}
+
+  FlowRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "{{ spec.project_name }}-flow-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: bedrock.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: flow-perms
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${ModelId}"
+{% if spec.specialists %}
+              - Effect: Allow
+                Action: bedrock:InvokeAgent
+                Resource:
+{% for s in spec.specialists %}
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:agent-alias/${{ '{' }}{{ s.pascal }}Agent}/*"
+{% endfor %}
+{% endif %}
+{% if spec.ingress.type == "lambda" %}
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt IngressLambda.Arn
+{% endif %}
+
+  Flow:
+    Type: AWS::Bedrock::Flow
+    Properties:
+      Name: "{{ spec.project_name }}-flow"
+      Description: "Scaffolded from {{ spec.project_name }}.yaml. See flow/flow-definition.json for full node graph."
+      ExecutionRoleArn: !GetAtt FlowRole.Arn
+      DefinitionS3Location:
+        Bucket: !Ref CaseBucket
+        Key: "flow-definition.json"
+
+  FlowVersion:
+    Type: AWS::Bedrock::FlowVersion
+    Properties:
+      FlowArn: !Ref Flow
+
+  FlowAlias:
+    Type: AWS::Bedrock::FlowAlias
+    Properties:
+      FlowArn: !Ref Flow
+      Name: live
+      RoutingConfiguration:
+        - FlowVersion: !GetAtt FlowVersion.Version
+
+Outputs:
+  FlowId:
+    Value: !GetAtt Flow.Id
+    Description: "Bedrock Flow identifier"
+  FlowAliasId:
+    Value: !GetAtt FlowAlias.Id
+    Description: "Flow alias identifier — use this for invoke_flow calls"
+  CaseBucketName:
+    Value: !Ref CaseBucket
+    Description: "S3 bucket name for flow I/O"

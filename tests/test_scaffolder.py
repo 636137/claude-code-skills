@@ -70,6 +70,36 @@ def test_va_tree_layout(va_tree: Path):
     assert _relfiles(va_tree) == VA_EXPECTED
 
 
+def test_telco_tree_has_kb_and_connect(telco_tree: Path):
+    files = _relfiles(telco_tree)
+    assert "kb/telco-faq.json" in files
+    assert "iam/kb-role-policy.json" in files
+    assert "channels/connect-contact-flow.json" in files
+    assert "channels/lex-bot.yaml" in files
+    assert "cfn/stack.yaml" in files
+    assert "cfn/parameters.json" in files
+    assert "channels/sms-handler-lambda.py" not in [f for f in files if "sms" in f]
+
+
+def test_cpg_tree_has_two_kbs_no_channels(cpg_tree: Path):
+    files = _relfiles(cpg_tree)
+    assert "kb/it-policy.json" in files
+    assert "kb/hr-policy.json" in files
+    assert "iam/kb-role-policy.json" in files
+    assert "cfn/stack.yaml" in files
+    assert not any("channels/" in f for f in files)
+
+
+def test_retail_tree_has_connect_and_sms(retail_tree: Path):
+    files = _relfiles(retail_tree)
+    assert "channels/connect-contact-flow.json" in files
+    assert "channels/lex-bot.yaml" in files
+    assert "lambda/sms_handler/lambda_function.py" in files
+    assert "cfn/stack.yaml" in files
+    # retail has no KBs
+    assert not any(f.startswith("kb/") for f in files)
+
+
 def test_scripts_executable(snap_tree: Path):
     import os, stat
     for name in ("deploy.sh", "teardown.sh", "invoke_flow.py"):

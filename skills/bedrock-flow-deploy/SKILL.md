@@ -78,3 +78,43 @@ Common entries:
 **Symptom**: First invoke fails with `AccessDeniedException` on `InvokeModel`.
 
 **Fix**: in the Bedrock console, go to "Model access" and enable the specific model ID for your region. This is a one-time manual step AWS requires per account.
+
+## CloudFormation: logical ID contains invalid characters
+
+**Symptom**: `cfn-lint` emits `E2001` or CFN deploy rejects with `does not match regex '^[a-zA-Z0-9]+$'`.
+
+**Cause**: Logical resource IDs and parameter names in CFN templates allow only alphanumerics. UPPER_SNAKE_CASE tokens (useful for shell env vars in `deploy.sh`) leak into CFN templates if you reuse the same derived field.
+
+**Fix**: use separate derived fields. The scaffolder emits both `kb_token` (UPPER_SNAKE, for shell placeholders) and `pascal` (PascalCase, for CFN logical IDs). Never use `kb_token` / `agent_token` inside `cfn/*.yaml.j2`.
+
+## CloudFormation: Parameter Default contains `${...}`
+
+**Symptom**: `cfn-lint` emits `E1029 Found an embedded parameter ... outside of an "Fn::Sub"`.
+
+**Cause**: CFN parameter `Default:` values are literal strings; `${AWS::AccountId}` only resolves inside `!Sub` / `Fn::Sub`. Parameters are resolved at stack-create time, before pseudo-parameter substitution happens.
+
+**Fix**: either drop the `Default:` and make the parameter required, or hardcode a placeholder like `CHANGEME`. If you want the account-scoped default, compute it in `parameters.json` at deploy time, not in the template.
+
+## IAM RoleName exceeds 64-character limit
+
+**Symptom**: `cfn-lint` emits `E3033 '...' is longer than 64`, or CFN create fails with `Role name ... is invalid`.
+
+**Cause**: IAM role names cap at 64 chars. The common-in-tutorials prefix `AmazonBedrockExecutionRoleForAgents_` is 38 chars, leaving only 26 for the rest — easily blown by `<project>-<specialist>` in long-named specialists.
+
+**Fix**: the scaffolder uses `BedrockAgentRole-` (17 chars) instead. Keep project_name + specialist name combined ≤ 47 chars.
+
+## OpenSearch Serverless collection missing
+
+**Symptom**: `create-knowledge-base` fails with `Collection does not exist` or `access denied to collection`.
+
+**Cause**: Bedrock KB's `OPENSEARCH_SERVERLESS` storage type requires a pre-existing AOSS collection + matching data-access policy granting the KB role `aoss:APIAccessAll`. The scaffolder's CFN stack does NOT create the collection — it's a separate prerequisite (~$350/mo floor, hence the intentional separation).
+
+**Fix**: create the collection by hand (console or a separate CFN stack), create a data-access policy that includes the KB role's ARN, then pass the collection ARN to the stack via the `OpenSearchCollectionArn` parameter.
+
+## Jinja `${{{...}}}` parse error
+
+**Symptom**: Scaffolder crashes with `jinja2.exceptions.TemplateSyntaxError: expected token 'end of print statement'`.
+
+**Cause**: Shell env-var interpolation inside Jinja looks like `${{{ kb.kb_token }}_COLLECTION_ID}`. Jinja parses `${{` as the start of an expression block and chokes.
+
+**Fix**: build the `${...}` envelope with string concat: `"{{ '${' + kb.kb_token + '_COLLECTION_ID}' }}"`. Ugly but unambiguous.

@@ -1,0 +1,256 @@
+# telco-care — archetype rebuild of OneReach's Lebara case study.
+# Source: https://onereach.ai/case-studies/lebara-transformed-customer-experience/
+#
+# OneReach built a voice + webchat customer-care system handling SIM swaps,
+# port-ins, balance inquiries, connectivity issues, and ID&V. Their case page
+# names zero integrations, so the tool schemas below use defensible stubs.
+# Swap the tool Lambdas for your real billing/provisioning/CRM systems.
+
+project_name: telco-care
+region: us-east-1
+model_id: us.anthropic.claude-haiku-4-5-20251001-v1:0
+
+ingress:
+  type: lambda
+  lambda:
+    name: ingress
+    description: "Normalize inbound Connect-voice / webchat payloads into { channel, customer_id, utterance }"
+
+channels: [connect]
+emit_cfn: true
+
+knowledge_bases:
+  - name: telco-faq
+    description: "Consumer-facing FAQ about balance, data usage, coverage, connectivity troubleshooting."
+    s3_source_uri: s3://CHANGEME-telco-kb-docs/
+    embedding_model_id: amazon.titan-embed-text-v2:0
+
+specialists:
+  - name: id-verification
+    description: "ID&V specialist — confirms caller identity before any account-modifying action."
+    instructions: |
+      You are an Identity & Verification specialist for a mobile carrier's customer-care
+      system. You verify the caller's identity BEFORE any balance-returning or
+      account-modifying action. Never skip this step.
+
+      Input: { customer_id, utterance, channel }
+
+      Protocol:
+      1. Call lookup_customer with customer_id. If not found, return VERDICT=UNKNOWN.
+      2. Call send_otp with the customer's registered mobile. Wait for caller to relay the code.
+      3. Call verify_otp. If verified, return VERDICT=VERIFIED.
+      4. Three failed verify_otp calls -> VERDICT=FAILED.
+    tools:
+      - operation_id: lookup_customer
+        description: "Look up a customer record by customer_id (MSISDN or account number)."
+        request:
+          type: object
+          required: [customer_id]
+          properties:
+            customer_id: { type: string }
+        response:
+          type: object
+          properties:
+            found: { type: boolean }
+            account_status: { type: string, enum: [ACTIVE, SUSPENDED, CLOSED] }
+            registered_mobile: { type: string }
+      - operation_id: send_otp
+        description: "Send a one-time passcode via SMS to the customer's registered mobile."
+        request:
+          type: object
+          required: [customer_id]
+          properties:
+            customer_id: { type: string }
+        response:
+          type: object
+          properties:
+            sent: { type: boolean }
+            challenge_id: { type: string }
+      - operation_id: verify_otp
+        description: "Verify a passcode the caller has provided. Returns VERIFIED / INCORRECT / EXPIRED."
+        request:
+          type: object
+          required: [challenge_id, passcode]
+          properties:
+            challenge_id: { type: string }
+            passcode: { type: string }
+        response:
+          type: object
+          properties:
+            verdict: { type: string, enum: [VERIFIED, INCORRECT, EXPIRED] }
+
+  - name: sim-swap
+    description: "SIM swap specialist — coordinates provisioning of a new SIM for the verified customer."
+    instructions: |
+      You are a SIM Swap specialist. You only run AFTER id-verification returned VERIFIED.
+
+      Protocol:
+      1. Call check_swap_eligibility. If ineligible, return STATUS=INELIGIBLE with reason.
+      2. Call reserve_new_sim to pick the next available SIM in the customer's region.
+      3. Call schedule_activation for the customer's preferred activation window.
+      4. Return STATUS=SCHEDULED with activation_time and new_sim_iccid.
+    tools:
+      - operation_id: check_swap_eligibility
+        description: "Check whether this account is eligible for a SIM swap right now."
+        request:
+          type: object
+          required: [customer_id]
+          properties:
+            customer_id: { type: string }
+        response:
+          type: object
+          properties:
+            eligible: { type: boolean }
+            reason: { type: string }
+            cooldown_hours: { type: integer }
+      - operation_id: reserve_new_sim
+        description: "Reserve a new SIM ICCID from the regional SIM pool."
+        request:
+          type: object
+          required: [customer_id, region]
+          properties:
+            customer_id: { type: string }
+            region: { type: string }
+        response:
+          type: object
+          properties:
+            new_iccid: { type: string }
+            reservation_expires_at: { type: string }
+      - operation_id: schedule_activation
+        description: "Schedule the SIM activation for the requested window."
+        request:
+          type: object
+          required: [customer_id, new_iccid, window]
+          properties:
+            customer_id: { type: string }
+            new_iccid: { type: string }
+            window: { type: string }
+        response:
+          type: object
+          properties:
+            confirmation_id: { type: string }
+            activation_time: { type: string }
+
+  - name: port-in
+    description: "Number porting specialist — coordinates porting a number from another carrier."
+    instructions: |
+      You are a Port-In specialist for mobile number porting. You only run AFTER
+      id-verification returned VERIFIED.
+
+      Protocol:
+      1. Call validate_port_request with the donor carrier + number. If invalid (e.g. number on a
+         port-freeze), return STATUS=REJECTED with reason.
+      2. Call submit_port_order. This creates an order in the porting workflow.
+      3. Return STATUS=SUBMITTED with expected_completion_date.
+    tools:
+      - operation_id: validate_port_request
+        description: "Validate a port-in request against the donor carrier's current status."
+        request:
+          type: object
+          required: [donor_carrier, donor_number]
+          properties:
+            donor_carrier: { type: string }
+            donor_number: { type: string }
+            account_pin: { type: string }
+        response:
+          type: object
+          properties:
+            valid: { type: boolean }
+            reason: { type: string }
+      - operation_id: submit_port_order
+        description: "Submit a port-in order to the national porting clearinghouse."
+        request:
+          type: object
+          required: [customer_id, donor_number, donor_carrier]
+          properties:
+            customer_id: { type: string }
+            donor_number: { type: string }
+            donor_carrier: { type: string }
+        response:
+          type: object
+          properties:
+            port_order_id: { type: string }
+            expected_completion_date: { type: string }
+
+  - name: balance-and-connectivity
+    description: "Balance + connectivity specialist — FAQ-backed self-service for common issues."
+    instructions: |
+      You are a Balance & Connectivity specialist. Your job is self-service answers for
+      common questions about data usage, balance, top-ups, and connectivity issues. Use the
+      attached knowledge base for general FAQs; use the tools for account-specific queries.
+
+      Protocol:
+      1. Call get_balance for the verified customer.
+      2. If the question is about connectivity (no signal, slow data, can't make calls),
+         call run_diagnostics.
+      3. Return STATUS=RESOLVED if you can answer; STATUS=NEEDS_ESCALATION otherwise.
+    knowledge_bases: [telco-faq]
+    tools:
+      - operation_id: get_balance
+        description: "Fetch current balance, data remaining, and plan details."
+        request:
+          type: object
+          required: [customer_id]
+          properties:
+            customer_id: { type: string }
+        response:
+          type: object
+          properties:
+            balance_amount: { type: number }
+            data_remaining_mb: { type: integer }
+            plan_name: { type: string }
+            next_renewal_date: { type: string }
+      - operation_id: run_diagnostics
+        description: "Run network-level diagnostics for a customer's current device / cell site."
+        request:
+          type: object
+          required: [customer_id]
+          properties:
+            customer_id: { type: string }
+        response:
+          type: object
+          properties:
+            signal_strength_dbm: { type: integer }
+            cell_site_id: { type: string }
+            known_outage: { type: boolean }
+            remediation_steps: { type: array, items: { type: string } }
+
+supervisor:
+  temperature: 0.0
+  max_tokens: 40
+  fusion_rules: |
+    You are the Supervisor for a mobile-carrier care flow. Combine specialist verdicts
+    into a single uppercase routing token: RESOLVED, NEEDS_AGENT, or NEEDS_CALLBACK.
+
+    Rules (strict, top-to-bottom, first-match wins):
+    1. id-verification returned VERDICT=FAILED -> NEEDS_AGENT (cannot proceed without verification)
+    2. id-verification returned VERDICT=UNKNOWN -> NEEDS_AGENT (account not found; human triage)
+    3. Any specialist returned STATUS=SCHEDULED, SUBMITTED, or RESOLVED -> RESOLVED
+    4. Any specialist returned STATUS=NEEDS_ESCALATION or INELIGIBLE with retry -> NEEDS_CALLBACK
+    5. Otherwise -> NEEDS_AGENT
+
+router:
+  branches: [RESOLVED, NEEDS_AGENT, NEEDS_CALLBACK]
+
+explainers:
+  RESOLVED:
+    instructions: |
+      You are writing a confirmation message to a telecom customer whose request was
+      handled successfully via self-service. Write a short (3-4 sentences) confirmation
+      naming what was done (SIM swap scheduled, port submitted, balance read, etc.) and
+      the next concrete step (e.g. "your new SIM will activate tomorrow between 9am and
+      noon"). No bullet points. No legal disclaimers unless asked.
+  NEEDS_AGENT:
+    instructions: |
+      You are writing a handoff message to a telecom customer being transferred to a
+      human agent. Write 2-3 sentences acknowledging the request, naming why automated
+      self-service could not complete it (e.g. "I wasn't able to verify your identity"
+      or "your account is flagged for manual review"), and reassuring them that an
+      agent will help shortly. Be warm but honest.
+  NEEDS_CALLBACK:
+    instructions: |
+      You are writing a callback message to a telecom customer whose request is valid
+      but can't be completed right now (e.g. SIM-swap cooldown window, network-wide
+      outage affecting connectivity diagnostics). Write 3-4 sentences naming why we
+      need to call back, when they can expect the callback, and what — if anything —
+      they should do in the meantime.

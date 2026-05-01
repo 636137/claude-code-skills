@@ -98,6 +98,45 @@ def _validate(spec: dict[str, Any]) -> None:
             f"explainers keys {sorted(explainers)} must exactly match router.branches {sorted(branches)}"
         )
 
+    # Optional: knowledge_bases
+    kbs = spec.get("knowledge_bases") or []
+    if not isinstance(kbs, list):
+        raise SpecError("knowledge_bases must be a list")
+    kb_names: set[str] = set()
+    for i, kb in enumerate(kbs):
+        if not isinstance(kb, dict):
+            raise SpecError(f"knowledge_bases[{i}] must be a mapping")
+        for k in ("name", "description", "s3_source_uri"):
+            if not kb.get(k):
+                raise SpecError(f"knowledge_bases[{i}] missing '{k}'")
+        if not KEBAB_RE.match(kb["name"]):
+            raise SpecError(f"knowledge_bases[{i}].name must be kebab-case, got {kb['name']!r}")
+        if kb["name"] in kb_names:
+            raise SpecError(f"knowledge_bases[{i}].name duplicated: {kb['name']!r}")
+        kb_names.add(kb["name"])
+
+    # Specialists may reference KBs by name; validate the references
+    specialist_names = {s["name"] for s in specialists}
+    for s in specialists:
+        for ref in s.get("knowledge_bases") or []:
+            if ref not in kb_names:
+                raise SpecError(
+                    f"specialist {s['name']!r} references unknown knowledge_base {ref!r}"
+                )
+
+    # Optional: channels
+    channels = spec.get("channels") or []
+    if not isinstance(channels, list):
+        raise SpecError("channels must be a list")
+    for ch in channels:
+        if ch not in ("connect", "sms"):
+            raise SpecError(f"channels entry must be 'connect' or 'sms'; got {ch!r}")
+
+    # Optional: emit_cfn
+    emit_cfn = spec.get("emit_cfn", False)
+    if not isinstance(emit_cfn, bool):
+        raise SpecError("emit_cfn must be a boolean")
+
 
 def _normalize(spec: dict[str, Any]) -> None:
     """Fill in defaults and add derived fields templates expect."""
@@ -112,6 +151,7 @@ def _normalize(spec: dict[str, Any]) -> None:
         s["agent_name"] = f"{spec['project_name']}-{s['name']}-agent"
         s["lambda_name"] = f"{spec['project_name']}-{s['name']}-actions"
         s["agent_token"] = s["name"].upper().replace("-", "_")  # for ${AGENT_X_ALIAS_ARN}
+        s["pascal"] = "".join(p.capitalize() for p in s["name"].split("-"))  # CFN logical ID
 
     # Ingress derived names
     ing = spec["ingress"]
@@ -136,6 +176,29 @@ def _normalize(spec: dict[str, Any]) -> None:
     for _, ex in spec["explainers"].items():
         ex.setdefault("temperature", 0.3)
         ex.setdefault("max_tokens", 400)
+
+    # Knowledge-base defaults + derived fields
+    spec.setdefault("knowledge_bases", [])
+    for kb in spec["knowledge_bases"]:
+        kb["snake"] = kb["name"].replace("-", "_")
+        kb["kb_resource"] = f"{spec['project_name']}-{kb['name']}-kb"
+        kb["kb_token"] = kb["name"].upper().replace("-", "_")
+        kb["pascal"] = "".join(p.capitalize() for p in kb["name"].split("-"))
+        kb.setdefault("embedding_model_id",
+                      "amazon.titan-embed-text-v2:0")
+        kb.setdefault("chunking_strategy", "FIXED_SIZE")
+
+    # Specialists may reference KBs; normalize to empty list if unset
+    for s in spec["specialists"]:
+        s.setdefault("knowledge_bases", [])
+
+    # Channels default + derived
+    spec.setdefault("channels", [])
+    spec["has_connect"] = "connect" in spec["channels"]
+    spec["has_sms"] = "sms" in spec["channels"]
+
+    # emit_cfn default
+    spec.setdefault("emit_cfn", False)
 
 
 # ----------------------------------------------------------------------------
@@ -208,6 +271,31 @@ def scaffold(spec: dict[str, Any], out: Path) -> list[Path]:
                               render("agent-openapi.json.j2", specialist=s)))
         written.append(_write(out, f"lambda/{s['snake']}_actions/lambda_function.py",
                               render("action-lambda.py.j2", specialist=s)))
+
+    # Knowledge bases (optional)
+    if spec["knowledge_bases"]:
+        written.append(_write(out, "iam/kb-role-policy.json",
+                              render("iam/kb-role-policy.json.j2")))
+        for kb in spec["knowledge_bases"]:
+            written.append(_write(out, f"kb/{kb['name']}.json",
+                                  render("kb/knowledge-base.json.j2", kb=kb)))
+
+    # Channels (optional)
+    if spec["has_connect"]:
+        written.append(_write(out, "channels/connect-contact-flow.json",
+                              render("channels/connect-contact-flow.json.j2")))
+        written.append(_write(out, "channels/lex-bot.yaml",
+                              render("channels/lex-bot.yaml.j2")))
+    if spec["has_sms"]:
+        written.append(_write(out, "lambda/sms_handler/lambda_function.py",
+                              render("channels/sms-handler-lambda.py.j2")))
+
+    # CloudFormation (optional)
+    if spec["emit_cfn"]:
+        written.append(_write(out, "cfn/stack.yaml",
+                              render("cfn/stack.yaml.j2")))
+        written.append(_write(out, "cfn/parameters.json",
+                              render("cfn/parameters.json.j2")))
 
     # Scripts
     written.append(_write(out, "scripts/deploy.sh",

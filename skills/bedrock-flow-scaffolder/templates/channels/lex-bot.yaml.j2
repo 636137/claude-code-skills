@@ -1,0 +1,56 @@
+# Amazon Lex V2 bot skeleton — provides speech-to-text capture for the Connect
+# contact flow. This is a minimal single-intent bot that captures free-form
+# utterance into a `userRequest` slot and passes control to the Bedrock flow
+# via the ingress Lambda. Extend with real intents if you need Lex-side
+# dialog management; otherwise keep it minimal and let Bedrock do the routing.
+
+botName: {{ spec.project_name }}-bot
+description: "Minimal capture bot for {{ spec.project_name }}. Extend with business intents as needed."
+roleArn: "arn:aws:iam::${AWS_ACCOUNT_ID}:role/aws-service-role/lexv2.amazonaws.com/AWSServiceRoleForLexV2Bots"
+dataPrivacy:
+  childDirected: false
+idleSessionTTLInSeconds: 300
+
+botLocales:
+  - localeId: en_US
+    description: "English (US) locale"
+    nluConfidenceThreshold: 0.40
+    voiceSettings:
+      voiceId: Joanna
+      engine: neural
+    intents:
+      - intentName: CaptureRequest
+        description: "Capture any customer utterance into a single slot."
+        sampleUtterances:
+          - {utterance: "I need help"}
+          - {utterance: "I have a question"}
+          - {utterance: "{userRequest}"}
+        slots:
+          - slotName: userRequest
+            description: "Free-form customer utterance"
+            slotTypeName: AMAZON.FreeFormInput
+            valueElicitationSetting:
+              slotConstraint: Required
+              promptSpecification:
+                maxRetries: 2
+                messageGroups:
+                  - message:
+                      plainTextMessage:
+                        value: "Go ahead, I'm listening."
+        intentConfirmationSetting:
+          promptSpecification:
+            maxRetries: 1
+            messageGroups:
+              - message:
+                  plainTextMessage:
+                    value: "Got it. One moment."
+          declinationResponse:
+            messageGroups:
+              - message:
+                  plainTextMessage:
+                    value: "Okay, let me transfer you."
+        fulfillmentCodeHook:
+          enabled: true
+      - intentName: FallbackIntent
+        description: "AMAZON.FallbackIntent — reached when no other intent matches."
+        parentIntentSignature: AMAZON.FallbackIntent

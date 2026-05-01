@@ -421,6 +421,38 @@ else
 fi
 save_state flow_alias_id "$ALIAS_ID"
 
+{% if spec.knowledge_bases %}
+# ---- Knowledge Bases (manual steps, flagged not auto-created) --------------
+echo
+echo "---- Knowledge Bases ----"
+echo "This stack references {{ spec.knowledge_bases | length }} Bedrock KB(s). KBs require an"
+echo "OpenSearch Serverless collection that this script does NOT create (it"
+echo "costs ~\$350/mo minimum). Create the collection first, then:"
+{% for kb in spec.knowledge_bases %}
+echo "  1. aws bedrock-agent create-knowledge-base --cli-input-json file://$ROOT/kb/{{ kb.name }}.json"
+echo "  2. aws bedrock-agent start-ingestion-job --knowledge-base-id <KB_ID> --data-source-id <DS_ID>"
+echo "  3. Attach {{ kb.name }} to its specialist agent via console or associate-agent-knowledge-base API."
+{% endfor %}
+{% endif %}
+{% if spec.has_connect %}
+echo
+echo "---- Amazon Connect ----"
+echo "Connect channel is enabled. To finish wiring:"
+echo "  1. Claim a Connect instance (console) if you don't already have one."
+echo "  2. Import channels/lex-bot.yaml into Lex V2 and publish an alias."
+echo "  3. aws connect create-contact-flow --instance-id <ID> --name {{ spec.project_name }}-flow \\"
+echo "       --type CONTACT_FLOW --content file://$ROOT/channels/connect-contact-flow.json"
+echo "  4. Associate a claimed phone number with the new contact flow."
+{% endif %}
+{% if spec.has_sms %}
+echo
+echo "---- AWS End User Messaging (SMS) ----"
+echo "SMS channel is enabled. To finish wiring:"
+echo "  1. Register an origination identity (short code, long code, or 10DLC)."
+echo "  2. Create an SNS topic for inbound SMS and subscribe the SMS handler Lambda."
+echo "  3. Package lambda/sms_handler/ and deploy with env vars FLOW_ID,"
+echo "     FLOW_ALIAS_ID, SMS_ORIGINATION_IDENTITY set."
+{% endif %}
 echo
 echo "============================================================"
 echo "  DEPLOY COMPLETE"

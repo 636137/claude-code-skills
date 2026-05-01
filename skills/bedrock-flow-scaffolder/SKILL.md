@@ -131,6 +131,33 @@ explainers:
     max_tokens: 400
     instructions: |
       ...
+
+# OPTIONAL: Knowledge Bases
+# Each KB is attached to one or more specialists by name. The scaffolder emits
+# a KB config JSON per entry and an IAM role policy; deploy.sh prints the manual
+# steps required (OpenSearch Serverless collection is NOT auto-created).
+knowledge_bases:
+  - name: telco-faq
+    description: "Customer-facing FAQ for balance/connectivity issues"
+    s3_source_uri: s3://my-kb-docs-bucket/telco-faq/
+    # Optional overrides:
+    # embedding_model_id: amazon.titan-embed-text-v2:0
+    # chunking_strategy: FIXED_SIZE
+
+specialists:
+  - name: balance-and-connectivity
+    instructions: "..."
+    tools: [...]
+    knowledge_bases: [telco-faq]       # must match a name in knowledge_bases above
+
+# OPTIONAL: Channels — non-flow-input delivery surfaces
+# Values: "connect" (Amazon Connect + Lex), "sms" (AWS End User Messaging).
+# Independent of ingress.type; e.g. ingress.type=lambda + channels=[connect]
+# means the Lambda is the flow entry and Connect feeds into it.
+channels: [connect, sms]
+
+# OPTIONAL: emit a CloudFormation template alongside deploy.sh
+emit_cfn: true
 ```
 
 The scaffolder rejects specs that:
@@ -157,5 +184,6 @@ The scaffolder rejects specs that:
 
 - Create AWS resources. That's `deploy.sh`'s job.
 - ML / fraud-scorer Lambda scaffolding. The SNAP reference has one; it's excluded from the generator because libgomp bundling + manylinux wheel pinning is fragile template territory. Users who need it can hand-author the extra Lambda after scaffold.
-- Knowledge-base attachment to agents.
+- Create OpenSearch Serverless collections for Knowledge Bases. The scaffolder emits KB config JSON but assumes the collection exists (it's stateful + ~$350/mo minimum, so you create it deliberately).
+- Claim Amazon Connect instances or register SMS origination identities. The scaffolder emits the contact-flow JSON / Lex bot YAML / SMS handler Lambda; wiring to your Connect instance or SMS short-code is a post-deploy manual step.
 - Multi-environment (dev/stage/prod) aliases. The generated scripts produce one `live` alias pointing at the latest flow version; users extending to multi-env should modify `deploy.sh`.

@@ -1,0 +1,33 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "InvokeEmbeddingModel",
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel"],
+      "Resource": [
+        "arn:aws:bedrock:*::foundation-model/amazon.titan-embed-text-v2:0",
+        "arn:aws:bedrock:*::foundation-model/amazon.titan-embed-text-v1",
+        "arn:aws:bedrock:*::foundation-model/cohere.embed-english-v3",
+        "arn:aws:bedrock:*::foundation-model/cohere.embed-multilingual-v3"
+      ]
+    },
+    {
+      "Sid": "ReadS3DataSources",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:ListBucket"],
+      "Resource": [
+        {%- for kb in spec.knowledge_bases %}
+        "{{ kb.s3_source_uri.replace('s3://', 'arn:aws:s3:::').rstrip('/') }}",
+        "{{ kb.s3_source_uri.replace('s3://', 'arn:aws:s3:::').rstrip('/') }}/*"{{ "," if not loop.last else "" }}
+        {%- endfor %}
+      ]
+    },
+    {
+      "Sid": "AOSSDataPlane",
+      "Effect": "Allow",
+      "Action": ["aoss:APIAccessAll"],
+      "Resource": "arn:aws:aoss:${AWS_REGION}:${AWS_ACCOUNT_ID}:collection/*"
+    }
+  ]
+}

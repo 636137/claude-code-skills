@@ -1,0 +1,70 @@
+{
+  "Version": "2019-10-30",
+  "StartAction": "welcome",
+  "Metadata": {
+    "entryPointPosition": {"x": 40, "y": 40},
+    "ActionMetadata": {
+      "welcome": {"position": {"x": 200, "y": 40}},
+      "getCustomerInput": {"position": {"x": 420, "y": 40}},
+      "invokeLambda": {"position": {"x": 660, "y": 40}},
+      "disconnect": {"position": {"x": 880, "y": 40}},
+      "transferToAgent": {"position": {"x": 660, "y": 200}}
+    },
+    "Name": "{{ spec.project_name }}-contact-flow",
+    "Description": "Minimal inbound contact flow wired to Lex bot + flow-ingress Lambda. Extend with business-specific branching before production use.",
+    "ContactFlowType": "CONTACT_FLOW"
+  },
+  "Actions": [
+    {
+      "Identifier": "welcome",
+      "Type": "MessageParticipant",
+      "Parameters": {
+        "Text": "Welcome. Please tell me briefly how I can help."
+      },
+      "Transitions": {"NextAction": "getCustomerInput"}
+    },
+    {
+      "Identifier": "getCustomerInput",
+      "Type": "GetParticipantInput",
+      "Parameters": {
+        "LexV2Bot": {
+          "AliasArn": "{{ '${' + spec.project_name.upper().replace('-', '_') + '_LEX_BOT_ALIAS_ARN}' }}"
+        },
+        "Text": "How can I help today?"
+      },
+      "Transitions": {
+        "NextAction": "invokeLambda",
+        "Errors": [{"ErrorType": "NoMatchingError", "NextAction": "transferToAgent"}]
+      }
+    },
+    {
+      "Identifier": "invokeLambda",
+      "Type": "InvokeLambdaFunction",
+      "Parameters": {
+        "LambdaFunctionARN": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:{{ spec.project_name }}-{{ spec.ingress.lambda_dir.replace('_', '-') if spec.ingress.type == 'lambda' else 'bda-invoker' }}",
+        "InvocationTimeLimitSeconds": "8"
+      },
+      "Transitions": {
+        "NextAction": "disconnect",
+        "Errors": [{"ErrorType": "NoMatchingError", "NextAction": "transferToAgent"}]
+      }
+    },
+    {
+      "Identifier": "disconnect",
+      "Type": "DisconnectParticipant",
+      "Parameters": {},
+      "Transitions": {}
+    },
+    {
+      "Identifier": "transferToAgent",
+      "Type": "TransferContactToQueue",
+      "Parameters": {
+        "QueueId": "${DEFAULT_QUEUE_ID}"
+      },
+      "Transitions": {
+        "NextAction": "disconnect",
+        "Errors": [{"ErrorType": "NoMatchingError", "NextAction": "disconnect"}]
+      }
+    }
+  ]
+}

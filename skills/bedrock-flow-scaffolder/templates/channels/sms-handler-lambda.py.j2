@@ -1,0 +1,90 @@
+"""SMS inbound handler for {{ spec.project_name }}.
+
+Receives inbound SMS from AWS End User Messaging via an SNS subscription,
+normalizes the payload, and invokes the Bedrock Prompt Flow. Replies via
+End User Messaging SendTextMessage.
+
+Event shape (SNS -> Lambda):
+    {
+        "Records": [{
+            "Sns": {"Message": "<JSON string from End User Messaging>"}
+        }]
+    }
+
+Inner message (after json.loads) includes:
+    {
+        "originationNumber": "+15551234567",
+        "destinationNumber": "+18445559999",
+        "messageBody": "customer's text",
+        "inboundMessageId": "...",
+        "messageKeyword": null
+    }
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import uuid
+from typing import Any
+
+import boto3
+
+log = logging.getLogger()
+log.setLevel(logging.INFO)
+
+FLOW_ID = os.environ["FLOW_ID"]
+FLOW_ALIAS_ID = os.environ["FLOW_ALIAS_ID"]
+SMS_ORIGINATION_IDENTITY = os.environ["SMS_ORIGINATION_IDENTITY"]
+
+_flow = boto3.client("bedrock-agent-runtime")
+_sms = boto3.client("pinpoint-sms-voice-v2")
+
+
+def _extract_reply(response_stream: Any) -> str:
+    for event in response_stream:
+        if "flowOutputEvent" in event:
+            return event["flowOutputEvent"]["content"].get("document", "")
+    return ""
+
+
+def _invoke_flow(message_body: str, customer_number: str) -> str:
+    resp = _flow.invoke_flow(
+        flowIdentifier=FLOW_ID,
+        flowAliasIdentifier=FLOW_ALIAS_ID,
+        inputs=[{
+            "nodeName": "FlowInput",
+            "nodeOutputName": "document",
+            "content": {"document": {
+                "channel": "sms",
+                "customer_id": customer_number,
+                "message": message_body,
+            }},
+        }],
+        executionId=str(uuid.uuid4()),
+    )
+    return _extract_reply(resp["responseStream"])
+
+
+def _send_sms(to_number: str, body: str) -> None:
+    _sms.send_text_message(
+        DestinationPhoneNumber=to_number,
+        OriginationIdentity=SMS_ORIGINATION_IDENTITY,
+        MessageBody=body[:1600],
+        MessageType="TRANSACTIONAL",
+    )
+
+
+def lambda_handler(event: dict, _context: Any) -> dict:
+    for record in event.get("Records", []):
+        try:
+            msg = json.loads(record["Sns"]["Message"])
+            customer = msg["originationNumber"]
+            body = msg["messageBody"]
+            log.info("inbound sms from=%s len=%d", customer, len(body))
+            reply = _invoke_flow(body, customer)
+            if reply:
+                _send_sms(customer, reply)
+        except Exception:
+            log.exception("failed to handle inbound sms record")
+    return {"statusCode": 200}

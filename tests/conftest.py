@@ -35,3 +35,18 @@ def snap_tree(tmp_path_factory) -> Path:
 @pytest.fixture(scope="session")
 def va_tree(tmp_path_factory) -> Path:
     return _scaffold("va-eligibility.yaml", tmp_path_factory.mktemp("va"))
+
+
+@pytest.fixture(scope="session")
+def telco_tree(tmp_path_factory) -> Path:
+    return _scaffold("telco-care.yaml", tmp_path_factory.mktemp("telco"))
+
+
+@pytest.fixture(scope="session")
+def cpg_tree(tmp_path_factory) -> Path:
+    return _scaffold("cpg-it-helpdesk.yaml", tmp_path_factory.mktemp("cpg"))
+
+
+@pytest.fixture(scope="session")
+def retail_tree(tmp_path_factory) -> Path:
+    return _scaffold("retail-store-ops.yaml", tmp_path_factory.mktemp("retail"))

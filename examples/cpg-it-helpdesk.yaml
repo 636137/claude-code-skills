@@ -1,0 +1,187 @@
+# cpg-it-helpdesk — archetype rebuild of OneReach's Fortune 100 CPG case study.
+# Source: https://onereach.ai/case-studies/global-fortune/
+#
+# OneReach deployed an "Intelligent Employee Assistant" for a ~300K-employee CPG
+# company covering IT (password resets across "dozens of systems") + HR
+# (onboarding, device eligibility). The case page names no specific backends, so
+# the tools below are 5 representative enterprise systems (Entra ID / Okta /
+# ServiceNow / Workday / Zebra MDM). Swap for your real inventory.
+#
+# Design choice: this is a "fat specialist" pattern, not a router-of-specialists.
+# The case describes one unified employee experience, so we give one helpdesk
+# agent a large tool belt rather than 6 sibling agents.
+
+project_name: cpg-it-helpdesk
+region: us-east-1
+model_id: us.anthropic.claude-haiku-4-5-20251001-v1:0
+
+ingress:
+  type: lambda
+  lambda:
+    name: ingress
+    description: "Normalize inbound Teams / Slack / webchat payloads into { employee_id, utterance }"
+
+emit_cfn: true
+
+knowledge_bases:
+  - name: it-policy
+    description: "IT policies: password rules, device-eligibility, acceptable-use, VPN access."
+    s3_source_uri: s3://CHANGEME-it-policy-docs/
+  - name: hr-policy
+    description: "HR policies: onboarding steps, leave, benefits, expense."
+    s3_source_uri: s3://CHANGEME-hr-policy-docs/
+
+specialists:
+  - name: helpdesk-agent
+    description: "Unified IT + HR helpdesk agent with representative tools across 5 enterprise systems."
+    instructions: |
+      You are the employee self-service assistant for a Fortune 100 consumer-goods
+      company. You handle IT tickets (password resets, device requests, VPN access)
+      and HR inquiries (onboarding status, leave balance, benefits questions).
+
+      Guidelines:
+      - ALWAYS verify employee identity via check_employee_status before any account-
+        modifying action (password reset, device order).
+      - For policy questions, search the attached knowledge bases FIRST before calling tools.
+      - If you can't fully resolve via self-service, call open_servicenow_ticket and explain.
+      - Return STATUS=RESOLVED when the employee's request has been completed end-to-end.
+      - Return STATUS=ESCALATED when you opened a ServiceNow ticket because the request
+        requires manual handling (e.g. a device request requires manager approval).
+
+      Protocol sketch:
+      1. Parse the utterance to classify intent (password-reset / device / onboarding / leave / other).
+      2. Call check_employee_status for the employee_id.
+      3. If intent is password-reset: ask which system (AD, Okta) and call the matching reset tool.
+      4. If intent is device: call check_device_eligibility, then order_new_device if eligible.
+      5. If intent is onboarding/leave: call the matching HR tool + consult hr-policy KB.
+      6. Otherwise call open_servicenow_ticket with the captured utterance.
+    knowledge_bases: [it-policy, hr-policy]
+    tools:
+      - operation_id: check_employee_status
+        description: "Look up an employee's active status and basic profile (manager, location, hire date)."
+        request:
+          type: object
+          required: [employee_id]
+          properties:
+            employee_id: { type: string }
+        response:
+          type: object
+          properties:
+            active: { type: boolean }
+            display_name: { type: string }
+            manager_id: { type: string }
+            location: { type: string }
+            hire_date: { type: string }
+      - operation_id: reset_password_ad
+        description: "Reset an employee's Active Directory / Entra ID password, sending the new temp password via secure delivery."
+        request:
+          type: object
+          required: [employee_id]
+          properties:
+            employee_id: { type: string }
+        response:
+          type: object
+          properties:
+            success: { type: boolean }
+            temp_password_delivery: { type: string, enum: [SMS, EMAIL, MANAGER] }
+      - operation_id: reset_password_okta
+        description: "Reset an employee's Okta password and trigger MFA re-enrollment."
+        request:
+          type: object
+          required: [employee_id]
+          properties:
+            employee_id: { type: string }
+        response:
+          type: object
+          properties:
+            success: { type: boolean }
+            reset_link_sent: { type: boolean }
+      - operation_id: check_device_eligibility
+        description: "Check whether an employee is eligible for a new company device based on role + tenure + policy."
+        request:
+          type: object
+          required: [employee_id, device_type]
+          properties:
+            employee_id: { type: string }
+            device_type: { type: string, enum: [LAPTOP, PHONE, TABLET] }
+        response:
+          type: object
+          properties:
+            eligible: { type: boolean }
+            reason: { type: string }
+            next_eligible_date: { type: string }
+      - operation_id: order_new_device
+        description: "Place a new-device order in the fulfilment system. Requires manager approval."
+        request:
+          type: object
+          required: [employee_id, device_type, shipping_address]
+          properties:
+            employee_id: { type: string }
+            device_type: { type: string, enum: [LAPTOP, PHONE, TABLET] }
+            shipping_address: { type: string }
+        response:
+          type: object
+          properties:
+            order_id: { type: string }
+            estimated_delivery_date: { type: string }
+            approval_status: { type: string, enum: [AUTO_APPROVED, PENDING_MANAGER, REJECTED] }
+      - operation_id: check_onboarding_status
+        description: "Return which onboarding tasks (I-9, benefits enrollment, IT provisioning) are complete for a recent hire."
+        request:
+          type: object
+          required: [employee_id]
+          properties:
+            employee_id: { type: string }
+        response:
+          type: object
+          properties:
+            completed_tasks: { type: array, items: { type: string } }
+            pending_tasks: { type: array, items: { type: string } }
+            overall_percent: { type: integer }
+      - operation_id: open_servicenow_ticket
+        description: "Open a ServiceNow ticket for the employee when self-service can't complete the request."
+        request:
+          type: object
+          required: [employee_id, subject, description]
+          properties:
+            employee_id: { type: string }
+            subject: { type: string }
+            description: { type: string }
+            priority: { type: string, enum: [P1, P2, P3, P4] }
+        response:
+          type: object
+          properties:
+            ticket_id: { type: string }
+            assigned_queue: { type: string }
+
+supervisor:
+  temperature: 0.0
+  max_tokens: 40
+  fusion_rules: |
+    You are the Supervisor for a CPG employee-helpdesk flow. The helpdesk agent
+    emits STATUS=RESOLVED or STATUS=ESCALATED directly. Pass through, uppercase.
+
+    Rules:
+    1. helpdesk-agent returned STATUS=RESOLVED -> RESOLVED
+    2. helpdesk-agent returned STATUS=ESCALATED -> ESCALATED
+    3. Otherwise -> ESCALATED
+
+router:
+  branches: [RESOLVED, ESCALATED]
+
+explainers:
+  RESOLVED:
+    instructions: |
+      You are writing a confirmation message to an employee whose IT or HR request was
+      handled end-to-end by self-service. Write 2-3 sentences naming what was done
+      (e.g. "I reset your Okta password and sent a reset link to your work email"),
+      plus the concrete next step (e.g. "the link expires in 24 hours"). Warm, brief,
+      no bullet points. Do not disclose internal system names if a friendlier phrasing
+      works (e.g. say "your password" rather than "your AD password").
+  ESCALATED:
+    instructions: |
+      You are writing a handoff message to an employee whose request was escalated to
+      a ServiceNow ticket. Write 2-3 sentences acknowledging the request, naming the
+      ticket number, and giving a realistic expectation for follow-up (typically "an
+      IT analyst will reach out within one business day"). Be respectful of their
+      time. No bullet points.

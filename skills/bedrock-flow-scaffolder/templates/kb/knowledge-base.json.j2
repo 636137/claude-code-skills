@@ -1,0 +1,41 @@
+{
+  "name": "{{ kb.kb_resource }}",
+  "description": "{{ kb.description }}",
+  "roleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/{{ spec.project_name }}-kb-role",
+  "knowledgeBaseConfiguration": {
+    "type": "VECTOR",
+    "vectorKnowledgeBaseConfiguration": {
+      "embeddingModelArn": "arn:aws:bedrock:${AWS_REGION}::foundation-model/{{ kb.embedding_model_id }}"
+    }
+  },
+  "storageConfiguration": {
+    "type": "OPENSEARCH_SERVERLESS",
+    "opensearchServerlessConfiguration": {
+      "collectionArn": "arn:aws:aoss:${AWS_REGION}:${AWS_ACCOUNT_ID}:collection/{{ '${' + kb.kb_token + '_COLLECTION_ID}' }}",
+      "vectorIndexName": "{{ kb.snake }}-index",
+      "fieldMapping": {
+        "vectorField": "bedrock-knowledge-base-default-vector",
+        "textField": "AMAZON_BEDROCK_TEXT_CHUNK",
+        "metadataField": "AMAZON_BEDROCK_METADATA"
+      }
+    }
+  },
+  "dataSource": {
+    "name": "{{ kb.name }}-s3-source",
+    "dataSourceConfiguration": {
+      "type": "S3",
+      "s3Configuration": {
+        "bucketArn": "{{ kb.s3_source_uri.replace('s3://', 'arn:aws:s3:::').rstrip('/') }}"
+      }
+    },
+    "vectorIngestionConfiguration": {
+      "chunkingConfiguration": {
+        "chunkingStrategy": "{{ kb.chunking_strategy }}"{% if kb.chunking_strategy == "FIXED_SIZE" %},
+        "fixedSizeChunkingConfiguration": {
+          "maxTokens": 512,
+          "overlapPercentage": 20
+        }{% endif %}
+      }
+    }
+  }
+}

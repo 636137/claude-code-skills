@@ -1,0 +1,19 @@
+[
+  {
+    "ParameterKey": "CaseBucketName",
+    "ParameterValue": "{{ spec.project_name }}-cases-CHANGEME-{{ spec.region }}"
+  },
+  {
+    "ParameterKey": "ModelId",
+    "ParameterValue": "{{ spec.model_id }}"
+  }{% if spec.knowledge_bases %},
+  {
+    "ParameterKey": "OpenSearchCollectionArn",
+    "ParameterValue": "arn:aws:aoss:{{ spec.region }}:CHANGEME-ACCOUNT:collection/CHANGEME-COLLECTION-ID"
+  }{% for kb in spec.knowledge_bases %},
+  {
+    "ParameterKey": "{{ kb.pascal }}DataSourceBucketArn",
+    "ParameterValue": "arn:aws:s3:::CHANGEME-{{ kb.name }}-bucket"
+  }{% endfor %}
+{% endif %}
+]
