@@ -1,0 +1,43 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "InvokeFoundationModel",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream",
+        "bedrock:GetInferenceProfile"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:${AWS_REGION}::foundation-model/{{ spec.model_id.replace('us.', '') }}",
+        "arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:inference-profile/{{ spec.model_id }}",
+        "arn:aws:bedrock:*::foundation-model/{{ spec.model_id.replace('us.', '') }}"
+      ]
+    }
+{%- if spec.ingress.type in ("bda", "lambda") %},
+    {
+      "Sid": "InvokeFlowLambdas",
+      "Effect": "Allow",
+      "Action": [ "lambda:InvokeFunction" ],
+      "Resource": [
+        {%- if spec.ingress.type == "bda" %}
+        "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:{{ spec.ingress.lambda_name }}"
+        {%- elif spec.ingress.type == "lambda" %}
+        "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:{{ spec.ingress.lambda.name }}"
+        {%- endif %}
+      ]
+    }
+{%- endif %}
+{%- if spec.specialists %},
+    {
+      "Sid": "InvokeAgentAliases",
+      "Effect": "Allow",
+      "Action": [ "bedrock:InvokeAgent" ],
+      "Resource": [
+        "arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:agent-alias/*"
+      ]
+    }
+{%- endif %}
+  ]
+}

@@ -1,0 +1,61 @@
+# {{ spec.project_name }} — Bedrock Prompt Flow
+
+Scaffolded by [`claude-code-skills/bedrock-flow-scaffolder`](https://github.com/ChadDHendren/claude-code-skills).
+
+## Shape
+
+- **Ingress**: `{{ spec.ingress.type }}`{% if spec.ingress.type == "bda" %} — Bedrock Data Automation with {{ spec.ingress.blueprints | length }} blueprint(s){% elif spec.ingress.type == "lambda" %} — `{{ spec.ingress.lambda.name }}` Lambda{% endif %}
+- **Specialists**: {{ spec.specialists | length }}{% if spec.specialists %} ({{ spec.specialists | map(attribute='name') | join(', ') }}){% endif %}
+- **Branches**: {{ spec.router.branches | join(' / ') }}
+- **Model**: `{{ spec.model_id }}`
+
+## Deploy
+
+Prereqs:
+- AWS CLI v2 authenticated (`AWS_PROFILE` pointing to an account with Bedrock enabled)
+- `jq`, `zip`
+- Python 3.11+ with `boto3`
+- Model access granted in the Bedrock console for `{{ spec.model_id }}`
+{%- if spec.ingress.type == "bda" %}
+- Bedrock Data Automation enabled in the region
+{%- endif %}
+
+```bash
+AWS_PROFILE=default AWS_REGION={{ spec.region }} bash scripts/deploy.sh
+```
+
+The script is idempotent — re-running it updates existing resources in place. All created ARNs are cached in `.deploy-state.json` (gitignored).
+
+## Invoke
+
+After deploy prints the `FLOW_ID` and `ALIAS_ID`:
+
+```bash
+FLOW_ID=<flow-id> \
+ALIAS_ID=<alias-id> \
+AWS_PROFILE=default \
+python3 scripts/invoke_flow.py <case-id>
+```
+
+## Teardown
+
+```bash
+AWS_PROFILE=default AWS_REGION={{ spec.region }} bash scripts/teardown.sh
+```
+
+Deletes in dependency order: flow alias → flow versions → flow → agents → agent role → Lambdas → Lambda roles{% if spec.ingress.type == "bda" %} → BDA project → BDA blueprints{% endif %} → S3 bucket contents → S3 bucket.
+
+## Layout
+
+```
+flow/                 Bedrock Prompt Flow graph (placeholders substituted at deploy)
+{%- if spec.ingress.type == "bda" %}
+bda/                  Bedrock Data Automation custom blueprints
+{%- endif %}
+{%- if spec.specialists %}
+agents/               Agent instructions + OpenAPI action-group schemas
+{%- endif %}
+lambda/               Lambda handlers (one directory per function)
+iam/                  Least-privilege policies (${AWS_ACCOUNT_ID} / ${AWS_REGION} rendered at deploy)
+scripts/              deploy.sh, teardown.sh, invoke_flow.py
+```

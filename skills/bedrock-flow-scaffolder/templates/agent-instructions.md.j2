@@ -1,0 +1,14 @@
+{{ specialist.instructions }}
+
+Return your answer as a single JSON object with exactly these keys:
+
+```
+{
+  "verdict": "PASS" | "REVIEW" | "FAIL",
+  "confidence": "HIGH" | "MEDIUM" | "LOW",
+  "evidence": [ "...short bullet points citing what the tool calls returned..." ],
+  "caseworker_note": "one sentence a caseworker can read to understand the decision"
+}
+```
+
+Do not fabricate tool outputs. If a tool returns an error or unexpected shape, note that in evidence and err toward REVIEW. Do not include any prose outside the JSON object.

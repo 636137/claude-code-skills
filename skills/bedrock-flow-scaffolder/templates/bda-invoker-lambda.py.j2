@@ -1,0 +1,112 @@
+"""BDA invoker Lambda.
+
+Reads the incoming {{ spec.project_name }} case envelope from the flow, lists PDFs
+under the S3 prefix, invokes Bedrock Data Automation against the configured
+project, and returns a merged object keyed by blueprint class name.
+
+Env vars set by deploy.sh:
+  BDA_PROJECT_ARN     - ARN of the Bedrock Data Automation project
+  OUTPUT_BUCKET       - S3 bucket for BDA output artifacts
+  ACCOUNT_ID          - AWS account
+  AWS_REGION_OVERRIDE - region for BDA client
+"""
+import json
+import os
+import time
+import uuid
+from typing import Any
+
+import boto3
+
+REGION = os.environ.get("AWS_REGION_OVERRIDE") or os.environ["AWS_REGION"]
+BDA_PROJECT_ARN = os.environ["BDA_PROJECT_ARN"]
+OUTPUT_BUCKET = os.environ["OUTPUT_BUCKET"]
+ACCOUNT_ID = os.environ["ACCOUNT_ID"]
+
+s3 = boto3.client("s3", region_name=REGION)
+bda_runtime = boto3.client("bedrock-data-automation-runtime", region_name=REGION)
+
+
+def _unwrap(event: dict) -> dict:
+    """Bedrock Prompt Flow wraps LambdaFunction inputs in {node:{inputs:[...]}}.
+
+    Accept either the raw {case_id,...} shape (direct invoke) or the wrapped
+    shape (flow-driven invoke).
+    """
+    if isinstance(event, dict) and event.get("node"):
+        inputs = event["node"].get("inputs") or []
+        for i in inputs:
+            if i.get("name") == "case":
+                return i.get("value") or {}
+    return event
+
+
+def _list_pdfs(bucket: str, prefix: str) -> list[str]:
+    paginator = s3.get_paginator("list_objects_v2")
+    keys = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []) or []:
+            if obj["Key"].lower().endswith(".pdf"):
+                keys.append(obj["Key"])
+    return keys
+
+
+def _run_bda(bucket: str, key: str) -> dict[str, Any]:
+    invocation_id = str(uuid.uuid4())
+    output_prefix = f"bda-output/{invocation_id}/"
+    resp = bda_runtime.invoke_data_automation_async(
+        inputConfiguration={"s3Uri": f"s3://{bucket}/{key}"},
+        outputConfiguration={"s3Uri": f"s3://{OUTPUT_BUCKET}/{output_prefix}"},
+        dataAutomationConfiguration={
+            "dataAutomationProjectArn": BDA_PROJECT_ARN,
+            "stage": "LIVE",
+        },
+        dataAutomationProfileArn=f"arn:aws:bedrock:{REGION}:{ACCOUNT_ID}:data-automation-profile/us.data-automation-v1",
+    )
+    inv_arn = resp["invocationArn"]
+
+    # Poll
+    for _ in range(120):
+        status = bda_runtime.get_data_automation_status(invocationArn=inv_arn)
+        s = status.get("status")
+        if s == "Success":
+            break
+        if s in ("ServiceError", "ClientError"):
+            raise RuntimeError(f"BDA failed for {key}: {status}")
+        time.sleep(2)
+
+    # Read the result
+    out_prefix = status["outputConfiguration"]["s3Uri"].split(f"s3://{OUTPUT_BUCKET}/", 1)[1]
+    listing = s3.list_objects_v2(Bucket=OUTPUT_BUCKET, Prefix=out_prefix)
+    for obj in listing.get("Contents", []) or []:
+        if obj["Key"].endswith("/custom_output/0/result.json"):
+            body = s3.get_object(Bucket=OUTPUT_BUCKET, Key=obj["Key"])["Body"].read()
+            return json.loads(body)
+    return {}
+
+
+def lambda_handler(event, context):
+    case = _unwrap(event)
+    case_id = case["case_id"]
+    bucket = case["s3_bucket"]
+    prefix = case["s3_prefix"]
+    household_size = case.get("household_size")
+
+    keys = _list_pdfs(bucket, prefix)
+    if not keys:
+        return {"case_id": case_id, "error": "no PDFs found", "s3_bucket": bucket, "s3_prefix": prefix}
+
+    merged: dict[str, Any] = {"case_id": case_id, "household_size": household_size}
+    for k in keys:
+        result = _run_bda(bucket, k)
+        # Merge by the blueprint's inferred class
+        inferred = result.get("inference_result") or {}
+        cls = (result.get("matched_blueprint") or {}).get("name")
+        if cls:
+            merged[cls] = inferred
+        else:
+            # Fallback: merge top-level keys
+            for k2, v2 in inferred.items():
+                merged.setdefault(k2, v2)
+
+    return merged

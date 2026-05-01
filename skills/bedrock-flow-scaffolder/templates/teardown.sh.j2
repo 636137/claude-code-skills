@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Tear down everything deploy.sh created, in dependency order.
+set -euo pipefail
+
+AWS_REGION="${AWS_REGION:-{{ spec.region }}}"
+: "${AWS_PROFILE:?set AWS_PROFILE}"
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+STATE_FILE="$ROOT/.deploy-state.json"
+AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+
+get_state() { jq -r --arg k "$1" '.[$k] // empty' "$STATE_FILE" 2>/dev/null || true; }
+
+# ---- Flow alias + versions + flow ------------------------------------------
+FLOW_ID=$(get_state flow_id)
+if [ -n "$FLOW_ID" ]; then
+  for alias_id in $(aws bedrock-agent list-flow-aliases --flow-identifier "$FLOW_ID" \
+                     --query 'flowAliasSummaries[].id' --output text 2>/dev/null); do
+    aws bedrock-agent delete-flow-alias --flow-identifier "$FLOW_ID" --alias-identifier "$alias_id" || true
+  done
+  for v in $(aws bedrock-agent list-flow-versions --flow-identifier "$FLOW_ID" \
+              --query 'flowVersionSummaries[?version!=`DRAFT`].version' --output text 2>/dev/null); do
+    aws bedrock-agent delete-flow-version --flow-identifier "$FLOW_ID" --flow-version "$v" || true
+  done
+  aws bedrock-agent delete-flow --flow-identifier "$FLOW_ID" --skip-resource-in-use-check || true
+fi
+aws iam delete-role-policy --role-name {{ spec.project_name }}-flow-role --policy-name {{ spec.project_name }}-flow-policy 2>/dev/null || true
+aws iam delete-role --role-name {{ spec.project_name }}-flow-role 2>/dev/null || true
+
+{% if spec.specialists %}
+# ---- Agents ---------------------------------------------------------------
+{%- for s in spec.specialists %}
+AGENT_ID=$(get_state "agent_id_{{ s.agent_name }}")
+if [ -n "$AGENT_ID" ]; then
+  for alias_id in $(aws bedrock-agent list-agent-aliases --agent-id "$AGENT_ID" \
+                     --query 'agentAliasSummaries[].agentAliasId' --output text 2>/dev/null); do
+    aws bedrock-agent delete-agent-alias --agent-id "$AGENT_ID" --agent-alias-id "$alias_id" || true
+  done
+  aws bedrock-agent delete-agent --agent-id "$AGENT_ID" --skip-resource-in-use-check 2>/dev/null || true
+fi
+{%- endfor %}
+
+AGENT_ROLE="AmazonBedrockExecutionRoleForAgents_{{ spec.project_name | replace('-', '_') }}"
+aws iam delete-role-policy --role-name "$AGENT_ROLE" --policy-name {{ spec.project_name }}-agent-policy 2>/dev/null || true
+aws iam delete-role --role-name "$AGENT_ROLE" 2>/dev/null || true
+
+# ---- Action-group Lambdas --------------------------------------------------
+{%- for s in spec.specialists %}
+aws lambda delete-function --function-name {{ s.lambda_name }} 2>/dev/null || true
+{%- endfor %}
+
+aws iam detach-role-policy --role-name {{ spec.project_name }}-action-lambda-role \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole 2>/dev/null || true
+aws iam delete-role --role-name {{ spec.project_name }}-action-lambda-role 2>/dev/null || true
+{% endif %}
+
+{% if spec.ingress.type == "bda" %}
+# ---- Ingress Lambda + BDA -------------------------------------------------
+aws lambda delete-function --function-name {{ spec.ingress.lambda_name }} 2>/dev/null || true
+aws iam delete-role-policy --role-name {{ spec.project_name }}-bda-invoker-role \
+  --policy-name {{ spec.project_name }}-ingress-policy 2>/dev/null || true
+aws iam detach-role-policy --role-name {{ spec.project_name }}-bda-invoker-role \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole 2>/dev/null || true
+aws iam delete-role --role-name {{ spec.project_name }}-bda-invoker-role 2>/dev/null || true
+
+PROJECT_ARN=$(get_state bda_project_arn)
+if [ -n "$PROJECT_ARN" ]; then
+  aws bedrock-data-automation delete-data-automation-project --project-arn "$PROJECT_ARN" 2>/dev/null || true
+fi
+
+{%- for bp in spec.ingress.blueprints %}
+BLUEPRINT_ARN=$(aws bedrock-data-automation list-blueprints --resource-owner ACCOUNT \
+  --query "blueprints[?blueprintName=='{{ bp.name }}'].blueprintArn | [0]" --output text 2>/dev/null || echo None)
+[ -n "$BLUEPRINT_ARN" ] && [ "$BLUEPRINT_ARN" != "None" ] && \
+  aws bedrock-data-automation delete-blueprint --blueprint-arn "$BLUEPRINT_ARN" 2>/dev/null || true
+{%- endfor %}
+{% elif spec.ingress.type == "lambda" %}
+aws lambda delete-function --function-name {{ spec.ingress.lambda.name }} 2>/dev/null || true
+aws iam detach-role-policy --role-name {{ spec.project_name }}-ingress-lambda-role \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole 2>/dev/null || true
+aws iam delete-role --role-name {{ spec.project_name }}-ingress-lambda-role 2>/dev/null || true
+{% endif %}
+
+# ---- S3 bucket -------------------------------------------------------------
+CASE_BUCKET=$(get_state case_bucket)
+if [ -n "$CASE_BUCKET" ]; then
+  aws s3 rm "s3://$CASE_BUCKET" --recursive 2>/dev/null || true
+  aws s3api delete-bucket --bucket "$CASE_BUCKET" 2>/dev/null || true
+fi
+
+rm -f "$STATE_FILE"
+echo "Teardown complete."

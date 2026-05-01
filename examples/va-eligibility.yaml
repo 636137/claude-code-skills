@@ -1,0 +1,57 @@
+# Minimal flow variant — no BDA, no specialists, no agents.
+# Just: custom Lambda ingress → classifier prompt → condition → 3 explainers.
+# Useful for "I already have structured data; I just need a decision + explanation."
+
+project_name: va-eligibility
+region: us-east-1
+model_id: us.anthropic.claude-haiku-4-5-20251001-v1:0
+
+ingress:
+  type: lambda
+  lambda:
+    name: ingress
+  # A user-supplied Lambda normalizes inbound payloads into a single `case` object
+  # that downstream prompt nodes can reference. Edit lambda/ingress/lambda_function.py
+  # after scaffolding to shape your input.
+
+supervisor:
+  temperature: 0.0
+  max_tokens: 40
+  fusion_rules: |
+    You are the VA Eligibility classifier. Given the normalized case JSON, return ONE
+    uppercase routing token and nothing else. Valid tokens: ELIGIBLE, INELIGIBLE, NEEDSREVIEW.
+
+    Rules (strict, top-to-bottom, first-match wins):
+    1. service_verified is false -> INELIGIBLE.
+    2. disability_rating >= 30 AND service_verified is true -> ELIGIBLE.
+    3. disability_rating < 30 AND income_within_limit is true -> ELIGIBLE.
+    4. missing_fields list is non-empty -> NEEDSREVIEW.
+    5. Otherwise -> NEEDSREVIEW.
+
+router:
+  branches: [ELIGIBLE, INELIGIBLE, NEEDSREVIEW]
+
+explainers:
+  ELIGIBLE:
+    temperature: 0.3
+    max_tokens: 400
+    instructions: |
+      You are writing a plain-English eligibility confirmation for a VA benefits applicant.
+      Write a warm, professional notice (4-6 sentences) confirming the applicant appears
+      eligible, summarizing which criteria were met, and naming next steps (document submission
+      deadlines, who will contact them). Do not commit to specific benefit amounts. No bullet points.
+  INELIGIBLE:
+    temperature: 0.3
+    max_tokens: 400
+    instructions: |
+      You are writing a plain-English ineligibility notice for a VA benefits applicant.
+      Write a respectful, clear notice (4-6 sentences) naming WHY the application does not
+      qualify under current rules, avoiding legal jargon, and explaining the applicant's right
+      to appeal within the statutory window. No bullet points.
+  NEEDSREVIEW:
+    temperature: 0.3
+    max_tokens: 400
+    instructions: |
+      You are writing a plain-English 'we need more information' notice. A caseworker will
+      follow up. Write a friendly notice (4-6 sentences) naming what is uncertain or missing
+      and describing what the applicant can do while they wait.

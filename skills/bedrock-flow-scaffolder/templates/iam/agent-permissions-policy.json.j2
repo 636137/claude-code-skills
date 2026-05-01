@@ -1,0 +1,29 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "InvokeFoundationModel",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream",
+        "bedrock:GetInferenceProfile"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:${AWS_REGION}::foundation-model/{{ spec.model_id.replace('us.', '') }}",
+        "arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:inference-profile/{{ spec.model_id }}",
+        "arn:aws:bedrock:*::foundation-model/{{ spec.model_id.replace('us.', '') }}"
+      ]
+    }{% if spec.specialists %},
+    {
+      "Sid": "InvokeActionGroupLambdas",
+      "Effect": "Allow",
+      "Action": [ "lambda:InvokeFunction" ],
+      "Resource": [
+        {%- for s in spec.specialists %}
+        "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:{{ s.lambda_name }}"{% if not loop.last %},{% endif %}
+        {%- endfor %}
+      ]
+    }{% endif %}
+  ]
+}

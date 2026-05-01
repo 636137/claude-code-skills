@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+# Idempotent end-to-end deployment of the {{ spec.project_name }} Bedrock Flow.
+#
+# Provisions, in order:
+#   1. S3 case bucket (used for {% if spec.ingress.type == "bda" %}BDA I/O{% else %}artifact staging{% endif %})
+{%- if spec.ingress.type == "bda" %}
+#   2. {{ spec.ingress.blueprints | length }} BDA custom blueprint(s) + a BDA project
+#   3. Ingress Lambda ({{ spec.ingress.lambda_name }}) + its IAM role
+{%- elif spec.ingress.type == "lambda" %}
+#   2. Ingress Lambda ({{ spec.ingress.lambda.name }}) + its IAM role
+{%- endif %}
+{%- if spec.specialists %}
+#   {{ 4 if spec.ingress.type == "bda" else 3 }}. Action-group Lambdas ({{ spec.specialists | length }}) + shared role
+#   {{ 5 if spec.ingress.type == "bda" else 4 }}. {{ spec.specialists | length }} Bedrock Agent(s) (prepared, aliased)
+{%- endif %}
+#   Final. Bedrock Prompt Flow graph + published alias
+#
+# Prereqs:
+#   - AWS CLI v2, admin permissions (or narrower if you've pre-created roles)
+#   - Bedrock model access for {{ spec.model_id }}
+{%- if spec.ingress.type == "bda" %}
+#   - Bedrock Data Automation enabled
+{%- endif %}
+#   - jq, zip
+#
+# Usage:
+#   AWS_PROFILE=default AWS_REGION={{ spec.region }} bash scripts/deploy.sh
+set -euo pipefail
+
+AWS_REGION="${AWS_REGION:-{{ spec.region }}}"
+: "${AWS_PROFILE:?set AWS_PROFILE}"
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+STATE_FILE="$ROOT/.deploy-state.json"
+
+AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+echo "Account: $AWS_ACCOUNT_ID  Region: $AWS_REGION"
+
+CASE_BUCKET="{{ spec.project_name }}-${AWS_ACCOUNT_ID}-${AWS_REGION}"
+FOUNDATION_MODEL_ID="{{ spec.model_id }}"
+
+{%- if spec.ingress.type == "bda" %}
+BDA_PROJECT_NAME="{{ spec.ingress.bda_project_name }}"
+BDA_BLUEPRINTS=({% for bp in spec.ingress.blueprints %}"{{ bp.name }}"{% if not loop.last %} {% endif %}{% endfor %})
+BDA_BLUEPRINT_FILES=(
+{%- for bp in spec.ingress.blueprints %}
+  "$ROOT/bda/blueprint-{{ bp.name }}.json"
+{%- endfor %}
+)
+INGRESS_LAMBDA="{{ spec.ingress.lambda_name }}"
+INGRESS_ROLE="{{ spec.project_name }}-bda-invoker-role"
+{%- elif spec.ingress.type == "lambda" %}
+INGRESS_LAMBDA="{{ spec.ingress.lambda.name }}"
+INGRESS_ROLE="{{ spec.project_name }}-ingress-lambda-role"
+{%- endif %}
+
+{%- if spec.specialists %}
+ACTION_LAMBDA_ROLE="{{ spec.project_name }}-action-lambda-role"
+{%- for s in spec.specialists %}
+{{ s.agent_token }}_LAMBDA="{{ s.lambda_name }}"
+{{ s.agent_token }}_AGENT_NAME="{{ s.agent_name }}"
+{%- endfor %}
+AGENT_ROLE="AmazonBedrockExecutionRoleForAgents_{{ spec.project_name | replace('-', '_') }}"
+{%- endif %}
+
+FLOW_NAME="{{ spec.project_name }}"
+FLOW_ROLE="{{ spec.project_name }}-flow-role"
+FLOW_ALIAS="live"
+
+render() {
+  sed -e "s|\${AWS_ACCOUNT_ID}|$AWS_ACCOUNT_ID|g" \
+      -e "s|\${AWS_REGION}|$AWS_REGION|g" \
+      -e "s|\${CASE_BUCKET}|$CASE_BUCKET|g" "$1"
+}
+
+save_state() {
+  local key="$1" value="$2"
+  if [ ! -f "$STATE_FILE" ]; then echo '{}' > "$STATE_FILE"; fi
+  jq --arg k "$key" --arg v "$value" '. + {($k): $v}' "$STATE_FILE" > "$STATE_FILE.tmp"
+  mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+get_state() { jq -r --arg k "$1" '.[$k] // empty' "$STATE_FILE" 2>/dev/null || true; }
+
+ensure_role() {
+  local role="$1" trust_file="$2"
+  if aws iam get-role --role-name "$role" >/dev/null 2>&1; then
+    echo "Role exists: $role"
+  else
+    aws iam create-role --role-name "$role" \
+      --assume-role-policy-document "file://$trust_file" >/dev/null
+    aws iam attach-role-policy --role-name "$role" \
+      --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+    echo "Created role $role — sleeping 10s for IAM propagation"
+    sleep 10
+  fi
+}
+
+package_and_deploy_lambda() {
+  local name="$1" src_dir="$2" role="$3" env_vars="$4"
+  local pkg
+  pkg="$(mktemp -d)/$name.zip"
+  (cd "$src_dir" && zip -q "$pkg" lambda_function.py)
+
+  if aws lambda get-function --function-name "$name" >/dev/null 2>&1; then
+    echo "Lambda exists: $name — updating"
+    aws lambda update-function-code --function-name "$name" --zip-file "fileb://$pkg" >/dev/null
+    aws lambda wait function-updated --function-name "$name"
+    if [ -n "$env_vars" ]; then
+      aws lambda update-function-configuration --function-name "$name" \
+        --environment "Variables=$env_vars" >/dev/null
+      aws lambda wait function-updated --function-name "$name"
+    fi
+  else
+    echo "Creating Lambda: $name"
+    local args=(
+      --function-name "$name"
+      --runtime python3.12
+      --role "arn:aws:iam::$AWS_ACCOUNT_ID:role/$role"
+      --handler lambda_function.lambda_handler
+      --timeout 180
+      --memory-size 512
+      --zip-file "fileb://$pkg"
+    )
+    if [ -n "$env_vars" ]; then
+      args+=(--environment "Variables=$env_vars")
+    fi
+    aws lambda create-function "${args[@]}" >/dev/null
+    aws lambda wait function-active --function-name "$name"
+  fi
+}
+
+# ---- 1. S3 bucket -----------------------------------------------------------
+if aws s3api head-bucket --bucket "$CASE_BUCKET" 2>/dev/null; then
+  echo "S3 bucket exists: $CASE_BUCKET"
+else
+  echo "Creating S3 bucket: $CASE_BUCKET"
+  if [ "$AWS_REGION" = "us-east-1" ]; then
+    aws s3api create-bucket --bucket "$CASE_BUCKET" --region "$AWS_REGION" >/dev/null
+  else
+    aws s3api create-bucket --bucket "$CASE_BUCKET" --region "$AWS_REGION" \
+      --create-bucket-configuration "LocationConstraint=$AWS_REGION" >/dev/null
+  fi
+  aws s3api put-public-access-block --bucket "$CASE_BUCKET" \
+    --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+fi
+save_state case_bucket "$CASE_BUCKET"
+
+{% if spec.ingress.type == "bda" %}
+# ---- 2. BDA blueprints + project -------------------------------------------
+BLUEPRINT_ARNS=()
+for i in "${!BDA_BLUEPRINTS[@]}"; do
+  name="${BDA_BLUEPRINTS[$i]}"
+  schema_file="${BDA_BLUEPRINT_FILES[$i]}"
+  existing_arn=$(aws bedrock-data-automation list-blueprints --resource-owner ACCOUNT \
+    --query "blueprints[?blueprintName=='$name'].blueprintArn | [0]" --output text 2>/dev/null || echo "None")
+  if [ -n "$existing_arn" ] && [ "$existing_arn" != "None" ]; then
+    echo "Blueprint exists: $name — updating"
+    aws bedrock-data-automation update-blueprint \
+      --blueprint-arn "$existing_arn" --schema "file://$schema_file" >/dev/null
+    arn="$existing_arn"
+  else
+    echo "Creating blueprint: $name"
+    arn=$(aws bedrock-data-automation create-blueprint \
+      --blueprint-name "$name" --type DOCUMENT \
+      --schema "file://$schema_file" \
+      --query 'blueprint.blueprintArn' --output text)
+  fi
+  BLUEPRINT_ARNS+=("$arn")
+done
+
+CUSTOM_OUTPUT=$(jq -n --argjson arns "$(printf '%s\n' "${BLUEPRINT_ARNS[@]}" | jq -R . | jq -s 'map({blueprintArn: .})')" \
+  '{blueprints: $arns}')
+
+STANDARD_OUTPUT='{
+  "document": {
+    "extraction":  { "granularity": {"types": ["DOCUMENT","PAGE"]}, "boundingBox": {"state": "ENABLED"} },
+    "generativeField": { "state": "DISABLED" },
+    "outputFormat": { "textFormat": {"types": ["PLAIN_TEXT"]}, "additionalFileFormat": {"state": "DISABLED"} }
+  },
+  "image": {
+    "extraction": { "category": {"state": "ENABLED", "types": ["TEXT_DETECTION"]}, "boundingBox": {"state": "ENABLED"} },
+    "generativeField": {"state": "DISABLED", "types": []}
+  }
+}'
+
+EXISTING_PROJECT_ARN=$(aws bedrock-data-automation list-data-automation-projects --resource-owner ACCOUNT \
+  --query "projects[?projectName=='$BDA_PROJECT_NAME'].projectArn | [0]" --output text 2>/dev/null || echo "None")
+
+if [ -n "$EXISTING_PROJECT_ARN" ] && [ "$EXISTING_PROJECT_ARN" != "None" ]; then
+  PROJECT_ARN="$EXISTING_PROJECT_ARN"
+  aws bedrock-data-automation update-data-automation-project \
+    --project-arn "$PROJECT_ARN" \
+    --standard-output-configuration "$STANDARD_OUTPUT" \
+    --custom-output-configuration "$CUSTOM_OUTPUT" >/dev/null
+else
+  PROJECT_ARN=$(aws bedrock-data-automation create-data-automation-project \
+    --project-name "$BDA_PROJECT_NAME" --project-description "{{ spec.project_name }} document understanding" \
+    --standard-output-configuration "$STANDARD_OUTPUT" \
+    --custom-output-configuration "$CUSTOM_OUTPUT" \
+    --query 'projectArn' --output text)
+fi
+save_state bda_project_arn "$PROJECT_ARN"
+echo "BDA project: $PROJECT_ARN"
+{% endif %}
+
+{% if spec.ingress.type in ("bda", "lambda") %}
+# ---- Ingress Lambda --------------------------------------------------------
+ensure_role "$INGRESS_ROLE" "$ROOT/iam/lambda-trust-policy.json"
+{%- if spec.ingress.type == "bda" %}
+render "$ROOT/iam/bda-invoker-lambda-policy.json" > /tmp/ingress.rendered.json
+aws iam put-role-policy --role-name "$INGRESS_ROLE" \
+  --policy-name {{ spec.project_name }}-ingress-policy \
+  --policy-document file:///tmp/ingress.rendered.json
+ENV_VARS_INGRESS="{BDA_PROJECT_ARN=$PROJECT_ARN,OUTPUT_BUCKET=$CASE_BUCKET,ACCOUNT_ID=$AWS_ACCOUNT_ID,AWS_REGION_OVERRIDE=$AWS_REGION}"
+package_and_deploy_lambda "$INGRESS_LAMBDA" "$ROOT/lambda/{{ spec.ingress.lambda_dir }}" "$INGRESS_ROLE" "$ENV_VARS_INGRESS"
+{%- else %}
+package_and_deploy_lambda "$INGRESS_LAMBDA" "$ROOT/lambda/{{ spec.ingress.lambda_dir }}" "$INGRESS_ROLE" ""
+{%- endif %}
+{% endif %}
+
+{% if spec.specialists %}
+# ---- Action-group Lambdas --------------------------------------------------
+ensure_role "$ACTION_LAMBDA_ROLE" "$ROOT/iam/lambda-trust-policy.json"
+{%- for s in spec.specialists %}
+package_and_deploy_lambda "{{ s.lambda_name }}" "$ROOT/lambda/{{ s.snake }}_actions" "$ACTION_LAMBDA_ROLE" ""
+{%- endfor %}
+
+# Grant Bedrock agent runtime permission to invoke the action-group Lambdas
+for fn in {% for s in spec.specialists %}"{{ s.lambda_name }}"{% if not loop.last %} {% endif %}{% endfor %}; do
+  aws lambda add-permission --function-name "$fn" \
+    --statement-id bedrock-agents-invoke \
+    --action lambda:InvokeFunction \
+    --principal bedrock.amazonaws.com \
+    --source-arn "arn:aws:bedrock:$AWS_REGION:$AWS_ACCOUNT_ID:agent/*" 2>/dev/null || true
+done
+
+# ---- Agent role ------------------------------------------------------------
+render "$ROOT/iam/agent-trust-policy.json" > /tmp/agent-trust.rendered.json
+render "$ROOT/iam/agent-permissions-policy.json" > /tmp/agent-perms.rendered.json
+
+if aws iam get-role --role-name "$AGENT_ROLE" >/dev/null 2>&1; then
+  aws iam put-role-policy --role-name "$AGENT_ROLE" \
+    --policy-name {{ spec.project_name }}-agent-policy \
+    --policy-document file:///tmp/agent-perms.rendered.json
+else
+  aws iam create-role --role-name "$AGENT_ROLE" \
+    --assume-role-policy-document file:///tmp/agent-trust.rendered.json >/dev/null
+  aws iam put-role-policy --role-name "$AGENT_ROLE" \
+    --policy-name {{ spec.project_name }}-agent-policy \
+    --policy-document file:///tmp/agent-perms.rendered.json
+  echo "Created agent role — sleeping 10s"
+  sleep 10
+fi
+AGENT_ROLE_ARN="arn:aws:iam::$AWS_ACCOUNT_ID:role/$AGENT_ROLE"
+
+ensure_agent() {
+  local name="$1" instructions_file="$2" openapi_file="$3" action_lambda="$4" desc="$5"
+  local existing_id
+  existing_id=$(aws bedrock-agent list-agents \
+    --query "agentSummaries[?agentName=='$name'].agentId | [0]" --output text 2>/dev/null || echo "None")
+
+  local instructions
+  instructions=$(cat "$instructions_file")
+
+  local agent_id
+  if [ -n "$existing_id" ] && [ "$existing_id" != "None" ]; then
+    echo "Agent exists: $name — updating"
+    aws bedrock-agent update-agent \
+      --agent-id "$existing_id" --agent-name "$name" \
+      --agent-resource-role-arn "$AGENT_ROLE_ARN" \
+      --foundation-model "$FOUNDATION_MODEL_ID" \
+      --description "$desc" --instruction "$instructions" >/dev/null
+    agent_id="$existing_id"
+  else
+    echo "Creating agent: $name"
+    agent_id=$(aws bedrock-agent create-agent \
+      --agent-name "$name" --agent-resource-role-arn "$AGENT_ROLE_ARN" \
+      --foundation-model "$FOUNDATION_MODEL_ID" \
+      --description "$desc" --instruction "$instructions" \
+      --idle-session-ttl-in-seconds 600 \
+      --query 'agent.agentId' --output text)
+  fi
+
+  local ag_id
+  ag_id=$(aws bedrock-agent list-agent-action-groups --agent-id "$agent_id" --agent-version DRAFT \
+    --query 'actionGroupSummaries[0].actionGroupId' --output text 2>/dev/null || echo "None")
+
+  local api_schema_json executor_json
+  api_schema_json=$(jq -c --rawfile s "$openapi_file" -n '{payload: $s}')
+  executor_json=$(jq -nc --arg arn "arn:aws:lambda:$AWS_REGION:$AWS_ACCOUNT_ID:function:$action_lambda" '{lambda: $arn}')
+
+  if [ -n "$ag_id" ] && [ "$ag_id" != "None" ]; then
+    aws bedrock-agent update-agent-action-group \
+      --agent-id "$agent_id" --agent-version DRAFT --action-group-id "$ag_id" \
+      --action-group-name "${name}-actions" \
+      --action-group-executor "$executor_json" \
+      --api-schema "$api_schema_json" \
+      --action-group-state ENABLED >/dev/null
+  else
+    aws bedrock-agent create-agent-action-group \
+      --agent-id "$agent_id" --agent-version DRAFT \
+      --action-group-name "${name}-actions" \
+      --action-group-executor "$executor_json" \
+      --api-schema "$api_schema_json" \
+      --action-group-state ENABLED >/dev/null
+  fi
+
+  aws bedrock-agent prepare-agent --agent-id "$agent_id" >/dev/null
+  for _ in $(seq 1 30); do
+    s=$(aws bedrock-agent get-agent --agent-id "$agent_id" --query 'agent.agentStatus' --output text)
+    [ "$s" = "PREPARED" ] && break
+    [ "$s" = "FAILED" ] && { echo "Agent prepare FAILED for $name"; exit 1; }
+    sleep 2
+  done
+
+  local alias_id
+  alias_id=$(aws bedrock-agent list-agent-aliases --agent-id "$agent_id" \
+    --query "agentAliasSummaries[?agentAliasName=='live'].agentAliasId | [0]" --output text 2>/dev/null || echo "None")
+  if [ -z "$alias_id" ] || [ "$alias_id" = "None" ]; then
+    alias_id=$(aws bedrock-agent create-agent-alias \
+      --agent-id "$agent_id" --agent-alias-name live \
+      --description "Live alias" \
+      --query 'agentAlias.agentAliasId' --output text)
+  fi
+  for _ in $(seq 1 30); do
+    s=$(aws bedrock-agent get-agent-alias --agent-id "$agent_id" --agent-alias-id "$alias_id" \
+      --query 'agentAlias.agentAliasStatus' --output text)
+    [ "$s" = "PREPARED" ] && break
+    sleep 2
+  done
+
+  AGENT_ALIAS_ARN="arn:aws:bedrock:$AWS_REGION:$AWS_ACCOUNT_ID:agent-alias/$agent_id/$alias_id"
+  save_state "agent_id_$name" "$agent_id"
+  save_state "agent_alias_$name" "$AGENT_ALIAS_ARN"
+  echo "  $name: $AGENT_ALIAS_ARN"
+}
+
+{% for s in spec.specialists %}
+ensure_agent "${{ '{' }}{{ s.agent_token }}_AGENT_NAME}" \
+  "$ROOT/agents/{{ s.name }}-instructions.md" \
+  "$ROOT/agents/{{ s.name }}-actions-openapi.json" \
+  "${{ '{' }}{{ s.agent_token }}_LAMBDA}" \
+  "{{ s.description | default(s.name + ' specialist for ' + spec.project_name) }}"
+{% endfor %}
+
+{%- for s in spec.specialists %}
+AGENT_{{ s.agent_token }}_ALIAS_ARN=$(get_state "agent_alias_{{ s.agent_name }}")
+{%- endfor %}
+{% endif %}
+
+# ---- Flow role -------------------------------------------------------------
+render "$ROOT/iam/flow-trust-policy.json" > /tmp/flow-trust.rendered.json
+render "$ROOT/iam/flow-permissions-policy.json" > /tmp/flow-perms.rendered.json
+if aws iam get-role --role-name "$FLOW_ROLE" >/dev/null 2>&1; then
+  aws iam put-role-policy --role-name "$FLOW_ROLE" \
+    --policy-name {{ spec.project_name }}-flow-policy \
+    --policy-document file:///tmp/flow-perms.rendered.json
+else
+  aws iam create-role --role-name "$FLOW_ROLE" \
+    --assume-role-policy-document file:///tmp/flow-trust.rendered.json >/dev/null
+  aws iam put-role-policy --role-name "$FLOW_ROLE" \
+    --policy-name {{ spec.project_name }}-flow-policy \
+    --policy-document file:///tmp/flow-perms.rendered.json
+  sleep 10
+fi
+
+# ---- Flow ------------------------------------------------------------------
+sed -e "s|\${AWS_ACCOUNT_ID}|$AWS_ACCOUNT_ID|g" \
+    -e "s|\${AWS_REGION}|$AWS_REGION|g" \
+{%- for s in spec.specialists %}
+    -e "s|\${AGENT_{{ s.agent_token }}_ALIAS_ARN}|$AGENT_{{ s.agent_token }}_ALIAS_ARN|g" \
+{%- endfor %}
+    "$ROOT/flow/flow-definition.json" > /tmp/flow-definition.rendered.json
+
+EXISTING_FLOW_ID=$(aws bedrock-agent list-flows \
+  --query "flowSummaries[?name=='$FLOW_NAME'].id | [0]" --output text)
+
+if [ -z "$EXISTING_FLOW_ID" ] || [ "$EXISTING_FLOW_ID" = "None" ]; then
+  FLOW_ID=$(aws bedrock-agent create-flow \
+    --name "$FLOW_NAME" --description "{{ spec.project_name }} — scaffolded Bedrock Prompt Flow" \
+    --execution-role-arn "arn:aws:iam::$AWS_ACCOUNT_ID:role/$FLOW_ROLE" \
+    --definition file:///tmp/flow-definition.rendered.json \
+    --query 'id' --output text)
+else
+  FLOW_ID="$EXISTING_FLOW_ID"
+  aws bedrock-agent update-flow \
+    --flow-identifier "$FLOW_ID" --name "$FLOW_NAME" \
+    --execution-role-arn "arn:aws:iam::$AWS_ACCOUNT_ID:role/$FLOW_ROLE" \
+    --definition file:///tmp/flow-definition.rendered.json >/dev/null
+fi
+save_state flow_id "$FLOW_ID"
+
+aws bedrock-agent prepare-flow --flow-identifier "$FLOW_ID" >/dev/null
+for _ in $(seq 1 30); do
+  s=$(aws bedrock-agent get-flow --flow-identifier "$FLOW_ID" --query 'status' --output text)
+  [ "$s" = "Prepared" ] && break
+  [ "$s" = "Failed" ] && { echo "Flow prepare FAILED"; aws bedrock-agent get-flow --flow-identifier "$FLOW_ID" --query 'validations'; exit 1; }
+  sleep 3
+done
+
+VERSION=$(aws bedrock-agent create-flow-version --flow-identifier "$FLOW_ID" --query 'version' --output text)
+for _ in $(seq 1 30); do
+  s=$(aws bedrock-agent get-flow-version --flow-identifier "$FLOW_ID" --flow-version "$VERSION" --query 'status' --output text)
+  [ "$s" = "Prepared" ] && break
+  sleep 2
+done
+
+ALIAS_ID=$(aws bedrock-agent list-flow-aliases --flow-identifier "$FLOW_ID" \
+  --query "flowAliasSummaries[?name=='$FLOW_ALIAS'].id | [0]" --output text)
+if [ -z "$ALIAS_ID" ] || [ "$ALIAS_ID" = "None" ]; then
+  ALIAS_ID=$(aws bedrock-agent create-flow-alias \
+    --flow-identifier "$FLOW_ID" --name "$FLOW_ALIAS" \
+    --description "Live alias" \
+    --routing-configuration "[{\"flowVersion\":\"$VERSION\"}]" \
+    --query 'id' --output text)
+else
+  aws bedrock-agent update-flow-alias \
+    --flow-identifier "$FLOW_ID" --alias-identifier "$ALIAS_ID" \
+    --name "$FLOW_ALIAS" \
+    --routing-configuration "[{\"flowVersion\":\"$VERSION\"}]" >/dev/null
+fi
+save_state flow_alias_id "$ALIAS_ID"
+
+echo
+echo "============================================================"
+echo "  DEPLOY COMPLETE"
+echo "============================================================"
+echo "  Case bucket : s3://$CASE_BUCKET"
+echo "  Flow ID     : $FLOW_ID"
+echo "  Flow alias  : $ALIAS_ID ($FLOW_ALIAS -> v$VERSION)"
+echo "  Console     : https://$AWS_REGION.console.aws.amazon.com/bedrock/home?region=$AWS_REGION#/flows/$FLOW_ID"
+echo
+echo "  Invoke:"
+echo "    FLOW_ID=$FLOW_ID ALIAS_ID=$ALIAS_ID python3 scripts/invoke_flow.py <case-id>"
+echo "============================================================"

@@ -1,0 +1,291 @@
+{%- set ing = spec.ingress -%}
+{%- set specialists = spec.specialists -%}
+{%- set branches = spec.router.branches -%}
+{%- set explainers = spec.explainers -%}
+{%- set model_id = spec.model_id -%}
+{
+  "nodes": [
+    {
+      "name": "FlowInput",
+      "type": "Input",
+      "configuration": { "input": {} },
+      "outputs": [
+        { "name": "document", "type": "Object" }
+      ]
+    }
+{%- if ing.type == "bda" %},
+
+    {
+      "name": "BDAInvoker",
+      "type": "LambdaFunction",
+      "configuration": {
+        "lambdaFunction": {
+          "lambdaArn": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:{{ ing.lambda_name }}"
+        }
+      },
+      "inputs": [
+        { "name": "case", "type": "Object", "expression": "$.data" }
+      ],
+      "outputs": [
+        { "name": "functionResponse", "type": "Object" }
+      ]
+    }
+{%- elif ing.type == "lambda" %},
+
+    {
+      "name": "IngressLookup",
+      "type": "LambdaFunction",
+      "configuration": {
+        "lambdaFunction": {
+          "lambdaArn": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:{{ ing.lambda.name }}"
+        }
+      },
+      "inputs": [
+        {%- for f in ing.lambda.input_fields %}
+        { "name": "{{ f }}", "type": "String", "expression": "$.data.{{ f }}" }{% if not loop.last %},{% endif %}
+        {%- endfor %}
+      ],
+      "outputs": [
+        { "name": "functionResponse", "type": "Object" }
+      ]
+    }
+{%- endif %}
+{%- for s in specialists %},
+
+    {
+      "name": "Build{{ s.name | capitalize }}Prompt",
+      "type": "Prompt",
+      "configuration": {
+        "prompt": {
+          "sourceConfiguration": {
+            "inline": {
+              "modelId": "{{ model_id }}",
+              "inferenceConfiguration": { "text": { "temperature": 0.0, "maxTokens": 600 } },
+              "templateType": "TEXT",
+              "templateConfiguration": {
+                "text": {
+                  "text": "Produce a compact JSON object for the {{ s.name }} specialist. Include only the fields relevant to its tools. Return JSON only, no prose.\n\n{{ '{{' }}payload{{ '}}' }}",
+                  "inputVariables": [ { "name": "payload" } ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "inputs": [
+        { "name": "payload", "type": "Object", "expression": "$.data" }
+      ],
+      "outputs": [
+        { "name": "modelCompletion", "type": "String" }
+      ]
+    },
+
+    {
+      "name": "{{ s.name | capitalize }}Agent",
+      "type": "Agent",
+      "configuration": {
+        "agent": {
+          "agentAliasArn": "${AGENT_{{ s.agent_token }}_ALIAS_ARN}"
+        }
+      },
+      "inputs": [
+        { "name": "agentInputText", "type": "String", "expression": "$.data" }
+      ],
+      "outputs": [
+        { "name": "agentResponse", "type": "String" }
+      ]
+    }
+{%- endfor %},
+
+    {
+      "name": "Supervisor",
+      "type": "Prompt",
+      "configuration": {
+        "prompt": {
+          "sourceConfiguration": {
+            "inline": {
+              "modelId": "{{ model_id }}",
+              "inferenceConfiguration": { "text": { "temperature": {{ spec.supervisor.temperature }}, "maxTokens": {{ spec.supervisor.max_tokens }} } },
+              "templateType": "TEXT",
+              "templateConfiguration": {
+                "text": {
+                  "text": "{{ spec.supervisor.fusion_rules | replace('\\', '\\\\') | replace('\n', '\\n') | replace('"', '\\"') }}\n\n{%- for s in specialists %}{{ s.name | upper }}: {{ '{{' }}{{ s.name }}{{ '}}' }}\n{%- endfor %}\n\nReturn ONE word from {{ '{' }}{{ branches | join(', ') }}{{ '}' }}. No other text.",
+                  "inputVariables": [
+                    {%- for s in specialists %}
+                    { "name": "{{ s.name }}" }{% if not loop.last %},{% endif %}
+                    {%- endfor %}
+                    {%- if not specialists %}
+                    { "name": "payload" }
+                    {%- endif %}
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "inputs": [
+        {%- if specialists %}
+        {%- for s in specialists %}
+        { "name": "{{ s.name }}", "type": "String", "expression": "$.data" }{% if not loop.last %},{% endif %}
+        {%- endfor %}
+        {%- else %}
+        { "name": "payload", "type": "String", "expression": "$.data" }
+        {%- endif %}
+      ],
+      "outputs": [
+        { "name": "modelCompletion", "type": "String" }
+      ]
+    },
+
+    {
+      "name": "Route",
+      "type": "Condition",
+      "configuration": {
+        "condition": {
+          "conditions": [
+            {%- for b in branches %}
+            { "name": "{{ b | lower }}", "expression": "input == \"{{ b }}\"" },
+            {%- endfor %}
+            { "name": "default" }
+          ]
+        }
+      },
+      "inputs": [
+        { "name": "input", "type": "String", "expression": "$.data" }
+      ]
+    }
+{%- for b in branches %},
+
+    {
+      "name": "Explain{{ b | capitalize }}",
+      "type": "Prompt",
+      "configuration": {
+        "prompt": {
+          "sourceConfiguration": {
+            "inline": {
+              "modelId": "{{ model_id }}",
+              "inferenceConfiguration": { "text": { "temperature": {{ explainers[b].temperature }}, "maxTokens": {{ explainers[b].max_tokens }} } },
+              "templateType": "TEXT",
+              "templateConfiguration": {
+                "text": {
+                  "text": "{{ explainers[b].instructions | replace('\\', '\\\\') | replace('\n', '\\n') | replace('"', '\\"') }}\n\n{%- for s in specialists %}{{ s.name | upper }}_JSON: {{ '{{' }}{{ s.name }}{{ '}}' }}\n{%- endfor %}",
+                  "inputVariables": [
+                    {%- for s in specialists %}
+                    { "name": "{{ s.name }}" }{% if not loop.last %},{% endif %}
+                    {%- endfor %}
+                    {%- if not specialists %}
+                    { "name": "payload" }
+                    {%- endif %}
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "inputs": [
+        {%- if specialists %}
+        {%- for s in specialists %}
+        { "name": "{{ s.name }}", "type": "String", "expression": "$.data" }{% if not loop.last %},{% endif %}
+        {%- endfor %}
+        {%- else %}
+        { "name": "payload", "type": "String", "expression": "$.data" }
+        {%- endif %}
+      ],
+      "outputs": [
+        { "name": "modelCompletion", "type": "String" }
+      ]
+    }
+{%- endfor %}
+{%- for b in branches %},
+
+    {
+      "name": "Output{{ b | capitalize }}",
+      "type": "Output",
+      "configuration": { "output": {} },
+      "inputs": [ { "name": "document", "type": "String", "expression": "$.data" } ]
+    }
+{%- endfor %},
+
+    {
+      "name": "OutputDefault",
+      "type": "Output",
+      "configuration": { "output": {} },
+      "inputs": [ { "name": "document", "type": "String", "expression": "$.data" } ]
+    }
+  ],
+
+  "connections": [
+{%- set conns = [] -%}
+{#- Ingress wiring -#}
+{%- if ing.type == "bda" -%}
+    {%- set _ = conns.append({"name": "Input_to_BDAInvoker", "source": "FlowInput", "target": "BDAInvoker", "src_out": "document", "tgt_in": "case"}) -%}
+{%- elif ing.type == "lambda" -%}
+    {%- for f in ing.lambda.input_fields -%}
+        {%- set _ = conns.append({"name": "Input_to_IngressLookup_" + f, "source": "FlowInput", "target": "IngressLookup", "src_out": "document", "tgt_in": f}) -%}
+    {%- endfor -%}
+{%- endif -%}
+{#- Ingress -> specialists -#}
+{%- for s in specialists -%}
+    {%- if ing.type == "bda" -%}
+        {%- set _ = conns.append({"name": "BDA_to_Build" + s.name|capitalize, "source": "BDAInvoker", "target": "Build" + s.name|capitalize + "Prompt", "src_out": "functionResponse", "tgt_in": "payload"}) -%}
+    {%- elif ing.type == "lambda" -%}
+        {%- set _ = conns.append({"name": "Ingress_to_Build" + s.name|capitalize, "source": "IngressLookup", "target": "Build" + s.name|capitalize + "Prompt", "src_out": "functionResponse", "tgt_in": "payload"}) -%}
+    {%- else -%}
+        {%- set _ = conns.append({"name": "Input_to_Build" + s.name|capitalize, "source": "FlowInput", "target": "Build" + s.name|capitalize + "Prompt", "src_out": "document", "tgt_in": "payload"}) -%}
+    {%- endif -%}
+    {%- set _ = conns.append({"name": "Build" + s.name|capitalize + "_to_" + s.name|capitalize + "Agent", "source": "Build" + s.name|capitalize + "Prompt", "target": s.name|capitalize + "Agent", "src_out": "modelCompletion", "tgt_in": "agentInputText"}) -%}
+    {%- set _ = conns.append({"name": s.name|capitalize + "_to_Supervisor", "source": s.name|capitalize + "Agent", "target": "Supervisor", "src_out": "agentResponse", "tgt_in": s.name}) -%}
+    {%- for b in branches -%}
+        {%- set _ = conns.append({"name": s.name|capitalize + "_to_Explain" + b|capitalize, "source": s.name|capitalize + "Agent", "target": "Explain" + b|capitalize, "src_out": "agentResponse", "tgt_in": s.name}) -%}
+    {%- endfor -%}
+{%- endfor -%}
+{#- No-specialists path: ingress flows straight into Supervisor + Explainers -#}
+{%- if not specialists -%}
+    {%- if ing.type == "bda" -%}
+        {%- set _ = conns.append({"name": "BDA_to_Supervisor", "source": "BDAInvoker", "target": "Supervisor", "src_out": "functionResponse", "tgt_in": "payload"}) -%}
+        {%- for b in branches -%}
+            {%- set _ = conns.append({"name": "BDA_to_Explain" + b|capitalize, "source": "BDAInvoker", "target": "Explain" + b|capitalize, "src_out": "functionResponse", "tgt_in": "payload"}) -%}
+        {%- endfor -%}
+    {%- elif ing.type == "lambda" -%}
+        {%- set _ = conns.append({"name": "Ingress_to_Supervisor", "source": "IngressLookup", "target": "Supervisor", "src_out": "functionResponse", "tgt_in": "payload"}) -%}
+        {%- for b in branches -%}
+            {%- set _ = conns.append({"name": "Ingress_to_Explain" + b|capitalize, "source": "IngressLookup", "target": "Explain" + b|capitalize, "src_out": "functionResponse", "tgt_in": "payload"}) -%}
+        {%- endfor -%}
+    {%- else -%}
+        {%- set _ = conns.append({"name": "Input_to_Supervisor", "source": "FlowInput", "target": "Supervisor", "src_out": "document", "tgt_in": "payload"}) -%}
+        {%- for b in branches -%}
+            {%- set _ = conns.append({"name": "Input_to_Explain" + b|capitalize, "source": "FlowInput", "target": "Explain" + b|capitalize, "src_out": "document", "tgt_in": "payload"}) -%}
+        {%- endfor -%}
+    {%- endif -%}
+{%- endif -%}
+{#- Supervisor -> Route -#}
+{%- set _ = conns.append({"name": "Supervisor_to_Route", "source": "Supervisor", "target": "Route", "src_out": "modelCompletion", "tgt_in": "input"}) -%}
+{#- Route -> each Explainer (Conditional) -#}
+{%- for b in branches -%}
+    {%- set _ = conns.append({"name": "Route_" + b|lower + "_to_Explain" + b|capitalize, "source": "Route", "target": "Explain" + b|capitalize, "type": "Conditional", "condition": b|lower}) -%}
+{%- endfor -%}
+{%- set _ = conns.append({"name": "Route_default_to_OutputDefault", "source": "Route", "target": "OutputDefault", "type": "Conditional", "condition": "default"}) -%}
+{#- Explainer -> Output -#}
+{%- for b in branches -%}
+    {%- set _ = conns.append({"name": "Explain" + b|capitalize + "_to_Output" + b|capitalize, "source": "Explain" + b|capitalize, "target": "Output" + b|capitalize, "src_out": "modelCompletion", "tgt_in": "document"}) -%}
+{%- endfor -%}
+{%- set _ = conns.append({"name": "Supervisor_to_OutputDefault", "source": "Supervisor", "target": "OutputDefault", "src_out": "modelCompletion", "tgt_in": "document"}) -%}
+{%- for c in conns %}
+    {
+      "name": "{{ c.name }}",
+      "source": "{{ c.source }}",
+      "target": "{{ c.target }}",
+      "type": "{{ c.get('type', 'Data') }}",
+      "configuration": {
+        {%- if c.get('type') == "Conditional" %}
+        "conditional": { "condition": "{{ c.condition }}" }
+        {%- else %}
+        "data": { "sourceOutput": "{{ c.src_out }}", "targetInput": "{{ c.tgt_in }}" }
+        {%- endif %}
+      }
+    }{% if not loop.last %},{% endif %}
+{%- endfor %}
+  ]
+}

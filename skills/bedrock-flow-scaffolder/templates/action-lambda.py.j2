@@ -1,0 +1,68 @@
+"""Action group for {{ specialist.name | capitalize }}Agent.
+
+Tools:
+{%- for tool in specialist.tools %}
+  - {{ tool.operation_id }}
+{%- endfor %}
+
+This is a stub — the handlers return placeholder JSON matching the OpenAPI
+response schema. Replace the handler bodies with calls to your real data
+sources (DMV API, employer registry, CRM lookup, whatever).
+"""
+import json
+
+
+def _bedrock_agent_envelope(event, response_body):
+    return {
+        "messageVersion": "1.0",
+        "response": {
+            "actionGroup": event.get("actionGroup"),
+            "apiPath": event.get("apiPath"),
+            "httpMethod": event.get("httpMethod"),
+            "httpStatusCode": 200,
+            "responseBody": {"application/json": {"body": json.dumps(response_body)}},
+        },
+        "sessionAttributes": event.get("sessionAttributes", {}),
+        "promptSessionAttributes": event.get("promptSessionAttributes", {}),
+    }
+
+
+def _params(event):
+    out = {}
+    for p in event.get("parameters", []) or []:
+        out[p["name"]] = p.get("value")
+    if not out and event.get("requestBody"):
+        for _mime, body in (event["requestBody"].get("content") or {}).items():
+            for p in body.get("properties", []) or []:
+                out[p["name"]] = p.get("value")
+    return out
+
+
+{% for tool in specialist.tools %}
+def {{ tool.operation_id }}(params):
+    """{{ tool.description | replace('\n', ' ') | truncate(140, true) }}
+
+    TODO: replace stub with real implementation.
+    """
+    return {
+        "stub": True,
+        "operation": "{{ tool.operation_id }}",
+        "received_params": params,
+    }
+
+
+{% endfor %}
+HANDLERS = {
+{%- for tool in specialist.tools %}
+    "/{{ tool.operation_id }}": {{ tool.operation_id }},
+{%- endfor %}
+}
+
+
+def lambda_handler(event, context):
+    api_path = event.get("apiPath", "")
+    handler = HANDLERS.get(api_path)
+    if not handler:
+        return _bedrock_agent_envelope(event, {"error": f"unknown apiPath: {api_path}"})
+    result = handler(_params(event))
+    return _bedrock_agent_envelope(event, result)

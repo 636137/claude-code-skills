@@ -1,0 +1,36 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "{{ specialist.name | capitalize }} Verification Actions",
+    "version": "1.0.0",
+    "description": "{{ specialist.description | default('Action-group tools for the ' + specialist.name + ' specialist.') }}"
+  },
+  "paths": {
+{%- for tool in specialist.tools %}
+    "/{{ tool.operation_id }}": {
+      "post": {
+        "description": "{{ tool.description | replace('"', '\\"') }}",
+        "operationId": "{{ tool.operation_id }}",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {{ tool.request | default({"type": "object", "properties": {}}) | tojson_indent | indent(14) }}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{{ tool.operation_id }} result",
+            "content": {
+              "application/json": {
+                "schema": {{ tool.response | default({"type": "object", "properties": {}}) | tojson_indent | indent(16) }}
+              }
+            }
+          }
+        }
+      }
+    }{% if not loop.last %},{% endif %}
+{%- endfor %}
+  }
+}

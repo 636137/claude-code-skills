@@ -1,0 +1,54 @@
+"""Invoke the deployed {{ spec.project_name }} flow against a case id.
+
+Usage:
+    FLOW_ID=<flow-id> ALIAS_ID=<alias-id> \
+    python3 scripts/invoke_flow.py <case_id> [additional-key=value ...]
+"""
+import json
+import os
+import sys
+import uuid
+
+import boto3
+
+FLOW_ID = os.environ["FLOW_ID"]
+ALIAS_ID = os.environ["ALIAS_ID"]
+REGION = os.environ.get("AWS_REGION", "{{ spec.region }}")
+
+if len(sys.argv) < 2:
+    print("Usage: invoke_flow.py <case_id> [key=value ...]", file=sys.stderr)
+    sys.exit(2)
+
+case_id = sys.argv[1]
+payload = {"case_id": case_id}
+for extra in sys.argv[2:]:
+    if "=" in extra:
+        k, v = extra.split("=", 1)
+        payload[k] = v
+
+client = boto3.client("bedrock-agent-runtime", region_name=REGION)
+resp = client.invoke_flow(
+    flowIdentifier=FLOW_ID,
+    flowAliasIdentifier=ALIAS_ID,
+    inputs=[{
+        "nodeName": "FlowInput",
+        "nodeOutputName": "document",
+        "content": {"document": payload},
+    }],
+    enableTrace=True,
+    executionId=str(uuid.uuid4()),
+)
+
+for event in resp["responseStream"]:
+    if "flowOutputEvent" in event:
+        fo = event["flowOutputEvent"]
+        print(f"\n=== Output: {fo.get('nodeName')} ===")
+        content = fo.get("content", {}).get("document")
+        if isinstance(content, (dict, list)):
+            print(json.dumps(content, indent=2))
+        else:
+            print(content)
+    elif "flowCompletionEvent" in event:
+        print(f"\nCompletion reason: {event['flowCompletionEvent'].get('completionReason')}")
+    elif "flowTraceEvent" in event:
+        pass  # quiet; set enableTrace=False or pipe through jq if you want traces

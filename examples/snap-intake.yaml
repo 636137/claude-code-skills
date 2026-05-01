@@ -1,0 +1,250 @@
+# Regenerates the SNAP intake reference flow (minus the optional fraud scorer).
+# BDA ingress with 3 document blueprints + 3 specialist agents + supervisor + router + 3 explainers.
+
+project_name: snap-intake
+region: us-east-1
+model_id: us.anthropic.claude-haiku-4-5-20251001-v1:0
+
+ingress:
+  type: bda
+  blueprints:
+    - name: id_document
+      class: US-Drivers-License-Or-State-ID
+      description: State-issued photo ID for SNAP applicant identity verification.
+      fields:
+        full_name:
+          type: string
+          instruction: Cardholder's full name as printed. Preserve exact casing.
+        date_of_birth:
+          type: string
+          instruction: Date of birth in YYYY-MM-DD format.
+        id_number:
+          type: string
+          instruction: Document/license number. Not SSN.
+        issuing_state:
+          type: string
+          instruction: Two-letter US state code of issuing authority.
+        expiration_date:
+          type: string
+          instruction: Expiration date in YYYY-MM-DD format.
+        document_appears_valid:
+          type: boolean
+          inferenceType: inferred
+          instruction: True if the document appears genuine, photograph present, no tampering. False if obviously fake.
+    - name: income_document
+      class: US-Paystub
+      description: Employer paystub for income verification.
+      fields:
+        payer_name:
+          type: string
+          instruction: Employer name.
+        gross_amount:
+          type: number
+          instruction: Gross pay for the period as a decimal number, no currency symbol.
+        pay_period:
+          type: string
+          instruction: Pay period frequency — one of WEEKLY, BIWEEKLY, SEMIMONTHLY, MONTHLY.
+        ytd_gross:
+          type: number
+          instruction: Year-to-date gross pay as a decimal number.
+    - name: residency_document
+      class: US-Utility-Bill
+      description: Utility bill for proof of residency.
+      fields:
+        service_address_line1:
+          type: string
+          instruction: Service address street line.
+        service_city:
+          type: string
+          instruction: Service address city.
+        service_state:
+          type: string
+          instruction: Service address two-letter state code.
+        statement_date:
+          type: string
+          instruction: Statement date in YYYY-MM-DD.
+
+specialists:
+  - name: identity
+    description: Identity verification specialist for SNAP intake.
+    instructions: |
+      You are an Identity Verification specialist for a state SNAP intake system. Your job is to decide whether the applicant's identity has been adequately established from their photo ID.
+
+      Input: a JSON payload with full_name, date_of_birth, id_number, issuing_state, expiration_date, and document_appears_valid.
+
+      Protocol:
+      1. Call check_id_validity with id_number, issuing_state, expiration_date. If INVALID, STOP and return FAIL.
+      2. Call cross_reference_name with full_name, date_of_birth, id_number, issuing_state. If match, identity is strongly verified.
+      3. If DMV record exists but name/DOB mismatch, return REVIEW (could be legal name change).
+      4. If no DMV record but document_appears_valid is true, return REVIEW.
+      5. If document_appears_valid is false, downgrade by one step.
+    tools:
+      - operation_id: check_id_validity
+        description: Check whether a state-issued photo ID is valid (not expired, not on fraud watchlist, cross-referenced against DMV).
+        request:
+          type: object
+          required: [id_number, issuing_state]
+          properties:
+            id_number: { type: string }
+            issuing_state: { type: string }
+            expiration_date: { type: string }
+        response:
+          type: object
+          properties:
+            verdict: { type: string, enum: [VALID, INVALID, UNVERIFIED] }
+            expired: { type: boolean }
+            reasons: { type: array, items: { type: string } }
+      - operation_id: cross_reference_name
+        description: Cross-reference applicant name and DOB against DMV record for this id_number.
+        request:
+          type: object
+          required: [full_name, date_of_birth, id_number, issuing_state]
+          properties:
+            full_name: { type: string }
+            date_of_birth: { type: string }
+            id_number: { type: string }
+            issuing_state: { type: string }
+        response:
+          type: object
+          properties:
+            match: { type: boolean }
+            name_match: { type: boolean }
+            dob_match: { type: boolean }
+
+  - name: income
+    description: Income verification specialist for SNAP intake.
+    instructions: |
+      You are an Income Verification specialist. Given a paystub extraction, determine whether the applicant's household income falls within the federal SNAP gross-income limit.
+
+      Protocol:
+      1. Call verify_employer with payer_name. If unknown, note it in evidence but continue.
+      2. Call compute_monthly_gross with gross_amount and pay_period.
+      3. Call check_snap_income_limit with monthly_gross and household_size.
+      4. Decision:
+         - within_limit true, margin > $200 → PASS / HIGH
+         - within_limit true, margin ≤ $200 → PASS / MEDIUM
+         - within_limit false, margin > -$300 → REVIEW
+         - within_limit false, margin ≤ -$300 → FAIL
+    tools:
+      - operation_id: verify_employer
+        description: Check whether the employer exists in the state registry.
+        request:
+          type: object
+          required: [payer_name]
+          properties:
+            payer_name: { type: string }
+        response:
+          type: object
+          properties:
+            known: { type: boolean }
+            category: { type: string }
+      - operation_id: compute_monthly_gross
+        description: Convert a per-period gross amount to monthly given pay frequency.
+        request:
+          type: object
+          required: [gross_amount, pay_period]
+          properties:
+            gross_amount: { type: number }
+            pay_period: { type: string }
+        response:
+          type: object
+          properties:
+            monthly_gross: { type: number }
+      - operation_id: check_snap_income_limit
+        description: Check monthly gross against federal SNAP gross-income limit for household size.
+        request:
+          type: object
+          required: [monthly_gross, household_size]
+          properties:
+            monthly_gross: { type: number }
+            household_size: { type: integer }
+        response:
+          type: object
+          properties:
+            within_limit: { type: boolean }
+            limit: { type: number }
+            margin: { type: number }
+
+  - name: residency
+    description: Residency verification specialist for SNAP intake.
+    instructions: |
+      You are a Residency Verification specialist. Confirm the applicant lives in the service jurisdiction.
+
+      Protocol:
+      1. Call compare_addresses with the ID address and utility bill service address.
+      2. Call check_service_jurisdiction with the service state.
+      3. Call check_document_recency with statement_date.
+      4. Decision:
+         - Exact match + in-service + recent → PASS / HIGH
+         - City+ZIP match + recent → PASS / MEDIUM
+         - Mismatch or stale → REVIEW
+         - Out of service area → FAIL
+    tools:
+      - operation_id: compare_addresses
+        description: Compare two addresses. Return exact, city_zip, or mismatch.
+        request:
+          type: object
+          required: [addr_a, addr_b]
+          properties:
+            addr_a: { type: object }
+            addr_b: { type: object }
+        response:
+          type: object
+          properties:
+            match_level: { type: string, enum: [EXACT, CITY_ZIP, MISMATCH] }
+      - operation_id: check_service_jurisdiction
+        description: Check whether the service state is in our supported jurisdiction list.
+        request:
+          type: object
+          required: [state]
+          properties:
+            state: { type: string }
+        response:
+          type: object
+          properties:
+            in_service: { type: boolean }
+            supported: { type: array, items: { type: string } }
+      - operation_id: check_document_recency
+        description: Check whether a statement date is within 60 days of today.
+        request:
+          type: object
+          required: [statement_date]
+          properties:
+            statement_date: { type: string }
+        response:
+          type: object
+          properties:
+            is_recent: { type: boolean }
+            age_days: { type: integer }
+
+supervisor:
+  temperature: 0.0
+  max_tokens: 40
+  fusion_rules: |
+    You are the Supervisor for a SNAP eligibility intake. Combine three specialist verdicts into a single uppercase routing token.
+
+    Rules (strict, top-to-bottom, first-match wins):
+    1. Any specialist verdict FAIL -> DENY.
+    2. All three PASS -> APPROVE.
+    3. Any specialist REVIEW -> REVIEW.
+    4. Otherwise -> REVIEW.
+
+router:
+  branches: [APPROVE, DENY, REVIEW]
+
+explainers:
+  APPROVE:
+    temperature: 0.3
+    max_tokens: 400
+    instructions: |
+      You are writing a plain-English approval notice for a SNAP applicant. All three verification specialists returned PASS. Write a warm, professional notice (4-6 sentences) confirming provisional approval pending final caseworker review, summarizing what was verified, and describing next steps. Do not promise specific benefit amounts. No bullet points.
+  DENY:
+    temperature: 0.3
+    max_tokens: 400
+    instructions: |
+      You are writing a plain-English denial notice for a SNAP applicant. At least one specialist returned FAIL. Write a respectful, clear notice (4-6 sentences) naming WHY the application was denied, avoiding legal jargon, and explaining the applicant's right to request a fair hearing within 90 days.
+  REVIEW:
+    temperature: 0.3
+    max_tokens: 400
+    instructions: |
+      You are writing a plain-English 'we need a bit more info' notice. A caseworker will follow up. Write a friendly notice (4-6 sentences) naming what is uncertain and what the applicant can do in the meantime.
